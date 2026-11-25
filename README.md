@@ -33,8 +33,8 @@ Standard library only. Python 3.8 or newer. MIT licence.
 Version 0.2, 25 November 2026.
 
 - **Tested:** 70 automated tests, on Python 3.8 and 3.13. They run the tool against a simulator of `gnoland` whose log lines, exit codes and start-up checks were copied from gno's source (`chain/mainnet` branch). Each log pattern the tool relies on was checked against the line in gno's source that prints it.
-- **Run against the live network:** the read-only commands (`plan`, `preflight`) against the public Onyx node on 25 November 2026.
-- **Not yet done:** managing a live node through a real halt. Our first live run is on our own Onyx node, before Onyx's next upgrade. Until then, treat `run` as tested in simulation only, and watch your node at each upgrade.
+- **Running on a live node:** since 25 November 2026 it runs our own Onyx node. It installed the release (checksum checked against the ledger), started the node and keeps it at the network's tip.
+- **Not yet done:** taking a live node through a real coordinated halt; Onyx's next upgrade will be the first. Until then, the switch at a halt is tested in simulation only, so watch your node at each upgrade.
 - **Reviewed:** three independent reviews. The first, of version 0.1, found 2 serious problems and 7 important ones; the second and third, of the fixes, found further edge cases. All are fixed in 0.2, and most fixes have a test that fails without them. See [CHANGELOG.md](CHANGELOG.md).
 
 ## Quick start (Onyx)
