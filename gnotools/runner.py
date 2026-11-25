@@ -105,6 +105,7 @@ class Runner:
         self.rpc_h = None         # last RPC height and when it last changed
         self.rpc_h_t = None
         self.rpc_catching_up = True
+        self.start_height = None  # height of the chain data when this child was started
 
     # ---- state ---------------------------------------------------------------------------
     def _save(self):
@@ -331,6 +332,7 @@ class Runner:
                 return EXIT_STOP
 
             self._reset_run()
+            self.start_height = self.height
             known_halts = ledger.halt_heights() | ({self.chain_halt[0]} if self.chain_halt else set())
             started = time.time()
             try:
@@ -354,7 +356,11 @@ class Runner:
                     # At the chain tip the node keeps running after a halt; stop it ourselves.
                     self._terminate("halted at block %d" % halt[0])
                     break
+                # Only a binary that was started below the halt can have halted there. A binary started
+                # at the halt height is the new release waiting for the other validators to restart:
+                # the height sits on the halt until two thirds of the voting power is back.
                 if (halt is None and self.rpc_h in known_halts and self.rpc_h_t is not None
+                        and self.start_height is not None and self.rpc_h > self.start_height
                         and not self.rpc_catching_up and now - self.rpc_h_t >= stall):
                     self.log("no halt line seen, but the height has stayed at the known halt height %d for %ds"
                              % (self.rpc_h, now - self.rpc_h_t))

@@ -17,7 +17,8 @@ previous halt.
 Chain description: JSON file in $FAKE_CHAIN. Node data (its height): JSON file in $FAKE_DATA.
 The version is read from a VERSION file next to this script.
 Test switches in the chain file: "noise_lines" (lines of non-UTF-8 output printed at start),
-"quiet_halt" (at the tip, halt without printing the halt line), "noise_per_block".
+"quiet_halt" (at the tip, halt without printing the halt line), "noise_per_block",
+"resume_delay" (seconds the network waits at a halt height before the next block).
 """
 
 import base64
@@ -133,6 +134,13 @@ def main():
     for i in range(int(chain.get("noise_lines", 0))):
         out.write(b"debug \xff\xfe not utf-8 " + (b"x" * 200) + b" %d\n" % i)
     out.flush()
+
+    # Restarted on the halt height after an upgrade: the network makes no block until enough
+    # validators are back ("resume_delay" seconds), while this node's RPC already answers.
+    if any(x == h for x, _f, _p in halts) and h >= tip:
+        end = time.time() + float(chain.get("resume_delay", 0))
+        while time.time() < end and not state["stop"]:
+            time.sleep(0.05)
 
     armed = None
     while not state["stop"]:

@@ -235,6 +235,22 @@ class RunnerRobustness(unittest.TestCase):
         finally:
             n.cleanup()
 
+    def test_new_release_waiting_at_the_halt_is_not_restarted(self):
+        # After the tip halt at 45 the network waits 5 s for validators to come back. The new release
+        # sits at height 45 longer than halt_stall_seconds (2 s); it must be left alone.
+        chain = dict(CHAIN, resume_delay=5)
+        n = TestNode(LEDGER, PENDING, chain, ALL, runner_extra={"halt_stall_seconds": 2})
+        try:
+            p = n.start_runner()
+            ok = n.wait_for(lambda: n.height() >= 48, timeout=90)
+            n.stop(p)
+            log = n.log_text()
+            self.assertTrue(ok, log[-3000:])
+            self.assertEqual(started_versions(log), ["v1.5.0", "v1.6.0", "v1.7.1", "v1.8.0", "v1.9.0"])
+            self.assertNotIn("no halt line seen", log)
+        finally:
+            n.cleanup()
+
     def test_broken_ledger_at_a_switch_stops_cleanly(self):
         n = TestNode(LEDGER, PENDING, dict(CHAIN, sync_interval=0.05), ALL)
         try:
