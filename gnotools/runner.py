@@ -7,7 +7,7 @@ Meant to be the ExecStart of a systemd unit. It:
   * when the node reaches a halt height, stops it if it is still running (at the chain tip the
     process stays up after a halt) and starts the version for the next block. The halt is seen
     either in the node's log ("halt height N reached") or, if no such line arrives, from the
-    RPC height sitting on a known halt height for `halt_stall_seconds`;
+    RPC height sitting for `halt_stall_seconds` on the height the chain's halt param names;
   * starts a binary recorded only in the local pending file only once the chain itself confirms
     that halt height (the chain's halt param, or a halt this runner saw happen);
   * refuses to start while another node already answers on the RPC port, and holds locks in the
@@ -80,6 +80,26 @@ def _lock(path):
         f.close()
         return None
     return f
+
+
+def pending_confirmed(entry, chain_halt=None, halts_seen=(), ref_halt=None):
+    """Whether the chain confirms the halt height of an upgrade known only from the pending file.
+
+    Confirmed by: the chain's halt param equal to that height; a halt at that height recorded in the
+    runner state (seen by the runner, or stated by the operator with `install --pending --past-halt`);
+    or the reference RPC's halt param equal to that height. Returns (bool, reason)."""
+    h = entry.get("halt_height")
+    if chain_halt and chain_halt[0] == h:
+        return True, "the chain's halt param is %d" % h
+    if h in set(halts_seen or ()):
+        return True, "the chain halted at %d (recorded in the runner state)" % h
+    if ref_halt and ref_halt[0] == h:
+        return True, "the reference RPC's halt param is %d" % h
+    seen = chain_halt[0] if chain_halt else (ref_halt[0] if ref_halt else "unknown")
+    return False, ("the chain does not confirm halt %d (last halt param seen: %s). If the height you recorded is "
+                   "wrong, record it again; if gno.land cancelled that halt, delete the entry from the pending "
+                   "file; if the halt did happen while the runner was not watching, stop the runner and record it "
+                   "with `install --pending --past-halt`" % (h, seen))
 
 
 class Runner:
@@ -266,18 +286,10 @@ class Runner:
 
     def _pending_confirmed(self, entry):
         """A binary known only from the local pending file starts only if the chain agrees on its halt."""
-        h = entry.get("halt_height")
-        if self.chain_halt and self.chain_halt[0] == h:
-            return True, "the chain's halt param is %d" % h
-        if h in self.halts_seen:
-            return True, "the chain halted at %d (recorded in the runner state)" % h
-        ref = self._reference_halt()
-        if ref and ref[0] == h:
-            return True, "the reference RPC's halt param is %d" % h
-        seen = self.chain_halt[0] if self.chain_halt else (ref[0] if ref else "unknown")
-        return False, ("the chain does not confirm halt %d (last halt param seen: %s). If gno.land cancelled that "
-                       "halt, delete the entry from the pending file; if the halt did happen and a later one is "
-                       "already scheduled, record it with `install --pending --past-halt`" % (h, seen))
+        ok, why = pending_confirmed(entry, self.chain_halt, self.halts_seen)
+        if ok:
+            return ok, why
+        return pending_confirmed(entry, self.chain_halt, self.halts_seen, self._reference_halt())
 
     # ---- main loop -----------------------------------------------------------------------
     def run(self):
@@ -344,15 +356,17 @@ class Runner:
                     return EXIT_STOP
                 self.log("%s (pending) confirmed: %s" % (version, why))
             if version == last_version and last_outcome == "too_new":
-                self.log("%s was refused before its halt and is still the version picked for block %d. Install "
-                         "the version for that block; if your replay plan forces %s here, set "
-                         "skip_upgrade_height to that halt height in config.toml for one restart and back to 0 "
-                         "afterwards, as gno.land's VALIDATOR.md describes" % (version, self.height + 1, version))
+                msg = ("%s was refused before its halt and is still the version picked for block %d. Install the "
+                       "version for that block" % (version, self.height + 1))
+                if reason.startswith("replay plan") and self.too_new:
+                    msg += ("; your replay plan forces %s here: if you have checked that this is right, set "
+                            "skip_upgrade_height = %d in config.toml for one restart and back to 0 afterwards, as "
+                            "gno.land's VALIDATOR.md describes" % (version, self.too_new[0]))
+                self.log(msg)
                 return EXIT_STOP
 
             self._reset_run()
             self.start_height = self.height
-            known_halts = ledger.halt_heights() | ({self.chain_halt[0]} if self.chain_halt and self.chain_halt[0] else set())
             started = time.time()
             try:
                 self.child = self._start(version)
@@ -375,13 +389,16 @@ class Runner:
                     # At the chain tip the node keeps running after a halt; stop it ourselves.
                     self._terminate("halted at block %d" % halt[0])
                     break
-                # Only a binary that was started below the halt can have halted there. A binary started
-                # at the halt height is the new release waiting for the other validators to restart:
-                # the height sits on the halt until two thirds of the voting power is back.
-                if (halt is None and self.rpc_h in known_halts and self.rpc_h_t is not None
+                # A stalled height counts as a halt only when the chain's own halt param is that height: a
+                # governance halt always reads param == H at height H. (A height from the ledger or the
+                # pending file alone is not enough: the chain may simply be slow there.) And only a binary
+                # started below the halt can have halted there: a binary started at the halt height is the
+                # new release waiting for two thirds of the voting power to come back.
+                if (halt is None and self.rpc_h is not None and self.chain_halt
+                        and self.chain_halt[0] == self.rpc_h and self.rpc_h_t is not None
                         and self.start_height is not None and self.rpc_h > self.start_height
                         and not self.rpc_catching_up and now - self.rpc_h_t >= stall):
-                    self.log("no halt line seen, but the height has stayed at the known halt height %d for %ds"
+                    self.log("no halt line seen, but the height has stayed at the chain's halt height %d for %ds"
                              % (self.rpc_h, now - self.rpc_h_t))
                     self.halt = (self.rpc_h, now)
                     self._note_height(self.rpc_h, "rpc at halt")

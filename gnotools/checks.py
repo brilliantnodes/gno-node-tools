@@ -14,7 +14,7 @@ from . import rpc
 from .install import installed_versions, sha256_file
 from .config import ConfigError
 from .ledger import LedgerError, choose_version, meets_min_version, parse_plan
-from .runner import load_state
+from .runner import load_state, pending_confirmed
 
 Result = namedtuple("Result", "level key text")
 
@@ -122,20 +122,36 @@ def run_checks(cfg, local_status=None):
             add("fail", "binary:" + v, "%s: %s" % (v, i["broken"]))
     add("ok" if good else "fail", "binaries", "installed and verified: %s" % (", ".join(sorted(good)) or "none"))
 
+    state = load_state(cfg)
     if height is not None:
         v, why = choose_version(ledger, height + 1, good, plan)
+        entry = (ledger.entry(v) or {}) if v else {}
+        confirmed, cwhy = True, ""
+        if entry.get("pending") and entry.get("kind") == "upgrade":
+            chain_halt = None
+            for src_rpc in ([base] if st else []) + ([ref] if ref else []):
+                try:
+                    chain_halt = rpc.scheduled_halt(src_rpc)
+                    break
+                except rpc.RPCError:
+                    continue
+            confirmed, cwhy = pending_confirmed(entry, chain_halt, state.get("halts_seen") or [])
         if v is None:
             add("fail", "next-binary", why)
+        elif not confirmed:
+            add("fail", "next-binary", "%s comes only from the pending file and %s" % (v, cwhy))
         else:
             add("ok", "next-binary", why)
             if st and st["build_version"] and st["build_version"] != v and not st["catching_up"]:
                 add("warn", "running-version", "node runs %s, the ledger rule picks %s for the next block" % (st["build_version"], v))
 
-    # Scheduled governance halt
+    # Scheduled governance halt (read from the local node, or the reference node while it is down)
     src = base if st else (ref or None)
     if src:
         try:
             hh, floor = rpc.scheduled_halt(src)
+            if height is None and src == ref:
+                height = rpc.status(ref)["height"]   # no local height yet: judge "ahead" by the network
             if hh and height is not None and hh > height:
                 spb = seconds_per_block(src, height) if height > 1 else None
                 blocks = hh - height

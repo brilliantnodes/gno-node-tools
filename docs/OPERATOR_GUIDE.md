@@ -15,7 +15,7 @@ alias gt='sudo -u gnoland /usr/bin/env PYTHONPATH=/opt/gno-node-tools /usr/bin/p
 | `/opt/gno/versions/<tag>/gnoland` | One binary per release, used only after its SHA-256 matched the ledger. |
 | `/opt/gno/versions/<tag>/gno/` | GNOROOT for that release: the gno source at the release commit. |
 | `/opt/gno/versions/<tag>/INSTALLED.json` | What was installed: checksum, commit, download link, time. |
-| `/opt/gno/state/runner.json` | The block height the runner starts from, the binary it last started, the last halt it saw, and the chain's halt parameter as last read. |
+| `/opt/gno/state/runner.json` | The block height the runner starts from, the binary it last started, the halts it has seen, and the chain's halt parameter as last read. |
 | `/opt/gno/state/watch.json` | The watch's memory of open problems. |
 | `/opt/gno/state/ledger-cache.json` | The last good copy of the official ledger. |
 | `/opt/gno/pending.json` | Upgrades voted on chain but not yet in the official ledger. |
@@ -37,7 +37,7 @@ Every setting has a default (`gnotools/config.py`); the example `examples/onyx.i
 | `node.start_args` | Arguments after `gnoland start`. `{chain_id}` and `{genesis}` are filled in. | `--chainid {chain_id} --genesis {genesis} --skip-genesis-sig-verification` |
 | `node.plan` | Which release replays which blocks when joining from genesis, if it differs from the ledger's own rule. | none |
 | `runner.halt_grace_seconds` | After the node logs a halt, how long to wait before stopping it. | 20 |
-| `runner.halt_stall_seconds` | With no halt line in the log, how long the height must stay on a known halt height before the runner treats it as halted. | 60 |
+| `runner.halt_stall_seconds` | With no halt line in the log, how long the height must stay on the height the chain's halt parameter names before the runner treats it as halted. | 60 |
 | `runner.stop_timeout_seconds` | How long to wait for the node to stop before killing it. | 90 |
 | `watch.reference_rpc` | A node you do not run, used to tell "my node is behind" from "the whole network stopped". Without it, a coordinated halt longer than 15 minutes is alerted. Public RPCs: `https://rpc.onyx.testnets.gno.land`, `https://rpc.gno.land`. | none |
 | `watch.service` | The systemd unit to check, e.g. `gno-node`. | none |
@@ -93,7 +93,7 @@ Do this between upgrades, not close to a halt. Your validator stops signing for 
 3. **Check:** `gt preflight` should now say the binary for after the halt is ready.
 4. **At the halt** the node stops after the halt block. The runner stops the process if it is still up, starts the new release, and logs each step (`journalctl -u gno-node | grep gno-runner`). Nothing to do unless the watch alerts.
 5. Once gno.land adds the upgrade to the official ledger, your pending entry is ignored automatically, even if gno.land records another tag for it; `gt preflight` then tells you it can be removed.
-6. If a halt has already happened but gno.land has not listed it yet, and a later halt is already scheduled (so the chain's halt parameter shows the later one), record it with `--past-halt --halt-height H --min-version vX.Y.Z`.
+6. If a halt has already happened but gno.land has not listed it yet, and a later halt is already scheduled (so the chain's halt parameter shows the later one), record it with `--past-halt --halt-height H --min-version vX.Y.Z`, added to the step-2 command. Stop the runner first (`sudo /usr/bin/systemctl stop gno-node`): a running runner overwrites its state file, and the command refuses while it runs.
 
 A halt with no minimum version has no version gate. The runner restarts the same release after it, unless the ledger or your pending file lists a release for that halt (mainnet's v1.3.0 to v1.5.0 were upgrades of this kind).
 
@@ -111,7 +111,7 @@ The runner exits with code **3** for problems a restart cannot fix; the example 
 |---|---|---|
 | `replay plan wants X for block N, but it is not installed` | The example configs set a replay plan, and that release is missing. | `gt install --version X` |
 | `block N needs one of ... none is installed` | The release for the next block is missing or its checksum no longer matches. | `gt install --for-height <N-1>` |
-| `... comes only from the pending file and the chain does not confirm halt H` | The halt height you recorded does not match the chain. | `gt preflight` shows the chain's halt; record it again with `gt install --pending`. |
+| `... comes only from the pending file and the chain does not confirm halt H` | The recorded height is wrong, GovDAO cancelled that halt, or it happened while the runner was not watching. | Wrong height: record it again with `gt install --pending`. Cancelled: delete the entry from the pending file. Already happened: stop the runner, then use `--past-halt` (section 4, step 6). |
 | `was refused before its halt and is still the version picked` | The runner's height record is behind the node's data, or the replay plan forces a release the node refuses here. | Install the release for that block; with a plan, follow the message (`skip_upgrade_height` for one restart). |
 | `is below the governance minimum` | The chain passed a halt this runner does not know about. | Record and install that release (section 4, step 2). |
 | `wrong AppHash` | That release cannot process these blocks. | Check `node.plan` and `gt plan`. |
@@ -119,7 +119,7 @@ The runner exits with code **3** for problems a restart cannot fix; the example 
 | `another runner holds the lock` | A second runner was started. | Leave the first one running. |
 | `the node already has chain data but the runner has no record of its height` | First start on an existing node. | `gt state --from-rpc` while the old node runs, or `gt state --set-height N`. |
 | `cannot read the ledger` | Neither the ledger nor its cached copy could be read. | Check `node.ledger` and the network. |
-| `no halt line seen, but the height has stayed at the known halt height` | The halt was detected from the block height instead of the log. | Nothing; it is logged so you know. |
+| `no halt line seen, but the height has stayed at the chain's halt height` | The halt was detected from the block height (the chain's halt parameter names that height) instead of the log. | Nothing; it is logged so you know. |
 
 ## 7. Keys, backups and double-signing
 

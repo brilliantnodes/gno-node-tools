@@ -12,6 +12,7 @@
 
 import argparse
 import json
+import os
 import sys
 
 from . import __version__, rpc
@@ -20,7 +21,7 @@ from .config import Config, ConfigError
 from .install import (InstallError, add_pending, install_genesis, install_version,
                       installed_versions)
 from .ledger import LedgerError, choose_version, parse_plan
-from .runner import Runner, load_state, save_state, set_height
+from .runner import Runner, _lock, load_state, save_state, set_height
 from .watch import check_once
 
 
@@ -70,9 +71,15 @@ def cmd_install(cfg, a):
                       "(for example the network's public RPC), or give --halt-height and --min-version." % (src, e))
                 return 1
             print("note: could not read the chain height from %s; checking against the ledger only" % src)
-        if a.past_halt and a.halt_height is None:
-            print("--past-halt needs --halt-height (and --min-version): the chain's params now show a later halt")
-            return 2
+        if a.past_halt:
+            if a.halt_height is None:
+                print("--past-halt needs --halt-height (and --min-version): the chain's params now show a later halt")
+                return 2
+            lockf = a._lockf = _lock(os.path.join(cfg.state_dir, "runner.lock"))
+            if lockf is None:
+                print("error: the runner is running and would overwrite its state file; stop it first "
+                      "(sudo /usr/bin/systemctl stop gno-node), then run this again")
+                return 1
         add_pending(cfg, ledger, a.version, hh, floor, a.commit, a.url, a.sha256,
                     chain_height=chain_height, rolling=a.rolling, past_halt=a.past_halt)
         if a.past_halt:
@@ -172,6 +179,9 @@ def main(argv=None):
     except (InstallError, LedgerError, ConfigError, rpc.RPCError, ValueError, OSError) as e:
         print("error: %s" % e)
         return 1
+    finally:
+        if getattr(a, "_lockf", None):
+            a._lockf.close()
 
 
 if __name__ == "__main__":

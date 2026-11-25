@@ -154,6 +154,26 @@ class Preflight(Base):
         self.assertEqual(self.levels()["halt"], "ok")
         self.assertIn("none scheduled ahead", self.texts()["halt"])
 
+    def test_halt_ahead_seen_from_the_reference_when_the_node_is_down(self):
+        # Before the first start: no local RPC, no runner height. A halt scheduled ahead on the network
+        # must not be reported as "none scheduled ahead".
+        self.local.close()
+        self.ref.s["halt"] = (5000, "v1.9.0")
+        t = self.texts()
+        self.assertIn("governance halt at 5000 in 4000 blocks", t["halt"])
+        self.local = FakeRPC()   # tearDown closes it
+
+    def test_unconfirmed_pending_release_fails_preflight(self):
+        self.node.add_version("v1.9.0")
+        with open(self.node.pending, "w") as f:
+            json.dump({"pending": [{"kind": "upgrade", "version": "v1.9.0", "commit": C, "halt_height": 900,
+                                    "halt_min_version": "v1.9.0"}]}, f)
+        self.local.s["halt"] = (0, "")            # cancelled: the chain does not confirm 900
+        self.assertEqual(self.levels()["next-binary"], "fail")
+        self.assertIn("does not confirm halt 900", self.texts()["next-binary"])
+        self.local.s["halt"] = (900, "v1.9.0")    # the chain's param confirms it
+        self.assertEqual(self.levels()["next-binary"], "ok")
+
     def test_config_halt_height_trap(self):
         with open(self.toml, "w") as f:
             f.write("halt_height = 5000\n[p2p]\n")

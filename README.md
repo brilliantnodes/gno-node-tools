@@ -32,10 +32,10 @@ Standard library only. Python 3.8 or newer. MIT licence.
 
 Version 0.2, 25 November 2026.
 
-- **Tested:** 63 automated tests, on Python 3.8 and 3.13. They run the tool against a simulator of `gnoland` whose log lines, exit codes and start-up checks were copied from gno's source (`chain/mainnet` branch). Each log pattern the tool relies on was checked against the line in gno's source that prints it.
+- **Tested:** 70 automated tests, on Python 3.8 and 3.13. They run the tool against a simulator of `gnoland` whose log lines, exit codes and start-up checks were copied from gno's source (`chain/mainnet` branch). Each log pattern the tool relies on was checked against the line in gno's source that prints it.
 - **Run against the live network:** the read-only commands (`plan`, `preflight`) against the public Onyx node on 25 November 2026.
 - **Not yet done:** managing a live node through a real halt. Our first live run is on our own Onyx node, before Onyx's next upgrade. Until then, treat `run` as tested in simulation only, and watch your node at each upgrade.
-- **Reviewed:** two independent reviews. The first, of version 0.1, found 2 serious problems and 7 important ones; the second, of the fixes, found 6 more edge cases. All are fixed in 0.2, and most fixes have a test that fails without them. See [CHANGELOG.md](CHANGELOG.md).
+- **Reviewed:** three independent reviews. The first, of version 0.1, found 2 serious problems and 7 important ones; the second and third, of the fixes, found further edge cases. All are fixed in 0.2, and most fixes have a test that fails without them. See [CHANGELOG.md](CHANGELOG.md).
 
 ## Quick start (Onyx)
 
@@ -59,9 +59,25 @@ sudo -u gnoland /usr/bin/env PYTHONPATH=/opt/gno-node-tools /usr/bin/python3 -m 
 sudo -u gnoland /usr/bin/env PYTHONPATH=/opt/gno-node-tools /usr/bin/python3 -m gnotools --config /etc/gno-node-tools/onyx.ini install --version v1.8.0-rc.1
 sudo -u gnoland /usr/bin/env PYTHONPATH=/opt/gno-node-tools /usr/bin/python3 -m gnotools --config /etc/gno-node-tools/onyx.ini genesis
 
-# 5. The node's own config and keys, made with the installed release, in the node's folder
-sudo -u gnoland /bin/sh -c 'cd /var/lib/gnoland && GNOROOT=/opt/gno/versions/v1.8.0-rc.1/gno /opt/gno/versions/v1.8.0-rc.1/gnoland config init && GNOROOT=/opt/gno/versions/v1.8.0-rc.1/gno /opt/gno/versions/v1.8.0-rc.1/gnoland secrets init'
-#    Then set the values in Onyx's VALIDATOR.md, section 3 (persistent peers, moniker, external address and the rest).
+# 5. The node's own config and keys, made with the installed release, in the node's folder.
+#    The settings are those of Onyx's VALIDATOR.md, section 3, as read on 25 November 2026: check them there.
+#    Replace the two values in <angle brackets> with your own.
+sudo -u gnoland /bin/sh -c '
+  set -e
+  cd /var/lib/gnoland
+  export GNOROOT=/opt/gno/versions/v1.8.0-rc.1/gno
+  G=/opt/gno/versions/v1.8.0-rc.1/gnoland
+  $G config init
+  $G secrets init
+  $G config set p2p.persistent_peers "g1x5mlj5ava0dw9vkf4j6admjlzswm6f06p44krn@seed-1.onyx.testnets.gno.land:26656,g1grq5zswt0dlwwe7clr4359w70k2ewgse0gcwck@seed-2.onyx.testnets.gno.land:26656"
+  $G config set application.prune_strategy syncable
+  $G config set consensus.timeout_commit 3s
+  $G config set consensus.peer_gossip_sleep_duration 10ms
+  $G config set p2p.flush_throttle_timeout 10ms
+  $G config set p2p.pex true
+  $G config set moniker "<your node name>"
+  $G config set p2p.external_address "<your public IP>:26656"
+'
 
 # 6. Check before the first start. Until the node runs, the "rpc" line fails (nothing answers yet):
 #    that one is expected; every other line should read OK.
@@ -77,7 +93,7 @@ sudo /usr/bin/systemctl enable --now gno-node.service gno-watch.timer
 
 - **Never two signers.** Two copies of one validator signing at once is double-signing, which gno.land says it will punish. The runner will not start while any node already answers on the RPC port, and it holds locks in its state folder and in the node's folder, so a second runner cannot start.
 - **Only checked binaries.** A binary is used only if its SHA-256 matches the ledger, and it is checked again just before each start. The ledger is loaded only over https or from a local file.
-- **Governance decides the halts.** The tool never edits `config.toml` and never sets a halt height. An upgrade recorded only in the local pending file is started only once the chain confirms that halt height.
+- **Governance decides the halts.** The tool never edits `config.toml` and never sets a halt height. An upgrade recorded only in the local pending file is started only once the chain confirms that halt height (its halt parameter, or a halt the runner saw), or once you state with `--past-halt` that it already happened.
 - **No upgrade depends on GitHub being up.** A good copy of the ledger is kept locally and used if the ledger cannot be downloaded.
 - **No restart loops on problems a restart cannot fix.** A missing or wrong binary, an unreadable ledger, or a second node makes the runner exit with code 3. The example systemd unit does not restart on that code. The log says what to do.
 

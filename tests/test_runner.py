@@ -46,6 +46,7 @@ class RunnerFromGenesis(unittest.TestCase):
                 st = json.load(f)
             self.assertEqual(st["version"], "v1.9.0")
             self.assertEqual(st["last_halt"], 45)
+            self.assertTrue({10, 20, 30, 45} <= set(st["halts_seen"]), st.get("halts_seen"))
         finally:
             n.cleanup()
 
@@ -230,7 +231,7 @@ class RunnerRobustness(unittest.TestCase):
             n.stop(p)
             log = n.log_text()
             self.assertTrue(ok, log[-3000:])
-            self.assertIn("no halt line seen, but the height has stayed at the known halt height 40", log)
+            self.assertIn("no halt line seen, but the height has stayed at the chain's halt height 40", log)
             self.assertEqual(started_versions(log), ["v1.5.0", "v1.6.0"])
         finally:
             n.cleanup()
@@ -273,6 +274,46 @@ class RunnerRobustness(unittest.TestCase):
             self.assertEqual(rc, EXIT_STOP, log[-2000:])
             self.assertIn("does not confirm halt 45", log)
             self.assertNotIn("starting v1.9.0", log)
+        finally:
+            n.cleanup()
+
+    def test_slow_chain_at_a_wrong_pending_height_is_not_a_halt(self):
+        # Pending v1.9.0 recorded at 38 (wrong; the real halt is 45, voted at block 44). Blocks come every
+        # 3 s, longer than halt_stall_seconds (2 s), so the height sits on 38 for a while. The chain's halt
+        # param there is still the old halt (30), so this is not a halt and v1.9.0 must not start.
+        bad = [dict(PENDING[0], halt_height=38)]
+        chain = dict(CHAIN, tip_interval=3, halts=[[10, "v1.6.0"], [20, "v1.7.0"], [30, "v1.8.0"], [45, "v1.9.0", 44]])
+        n = TestNode(LEDGER, bad, chain, ALL, runner_extra={"halt_stall_seconds": 2})
+        try:
+            n.set_data_height(36)
+            os.makedirs(os.path.join(n.root, "state"))
+            with open(os.path.join(n.root, "state", "runner.json"), "w") as f:
+                json.dump({"height": 36}, f)
+            p = n.start_runner()
+            ok = n.wait_for(lambda: n.height() >= 40, timeout=60)
+            n.stop(p)
+            log = n.log_text()
+            self.assertTrue(ok, log[-2000:])
+            self.assertNotIn("no halt line seen", log)
+            self.assertNotIn("starting v1.9.0", log)
+        finally:
+            n.cleanup()
+
+    def test_halt_recorded_in_state_confirms_a_pending_release(self):
+        # The runner state records that the chain halted at 45 (no chain param cached, no reference node):
+        # that alone confirms the pending v1.9.0, which starts and makes blocks.
+        n = TestNode(LEDGER, PENDING, CHAIN, ALL)
+        try:
+            n.set_data_height(45)
+            os.makedirs(os.path.join(n.root, "state"))
+            with open(os.path.join(n.root, "state", "runner.json"), "w") as f:
+                json.dump({"height": 45, "halts_seen": [45]}, f)
+            p = n.start_runner()
+            ok = n.wait_for(lambda: n.height() >= 47, timeout=60)
+            n.stop(p)
+            log = n.log_text()
+            self.assertTrue(ok, log[-2000:])
+            self.assertIn("v1.9.0 (pending) confirmed: the chain halted at 45", log)
         finally:
             n.cleanup()
 

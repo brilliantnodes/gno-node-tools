@@ -263,10 +263,16 @@ def add_pending(cfg, ledger, version, halt_height, halt_min_version, commit, url
             raise InstallError("halt height %d is not after the ledger's last halt %d: that halt is already "
                                "behind the chain (the params keep showing it until a new halt is voted)"
                                % (halt_height, last))
-        if chain_height is not None and halt_height <= chain_height and not past_halt:
+        if past_halt:
+            if chain_height is None:
+                raise InstallError("--past-halt needs the chain's current height: pass --rpc with a node that answers")
+            if halt_height >= chain_height:
+                raise InstallError("halt height %d is not behind the chain (height %d), so it has not happened yet"
+                                   % (halt_height, chain_height))
+        elif chain_height is not None and halt_height <= chain_height:
             raise InstallError("halt height %d is not ahead of the chain (height %d). If that halt has already "
-                               "happened and the official ledger does not list it yet, add --past-halt"
-                               % (halt_height, chain_height))
+                               "happened and the official ledger does not list it yet, stop the runner and add "
+                               "--past-halt" % (halt_height, chain_height))
         if halt_min_version and parse_version(halt_min_version) is None:
             raise InstallError("halt_min_version %r is not a vMAJOR.MINOR.PATCH tag" % halt_min_version)
     data = {"pending": []}

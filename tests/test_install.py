@@ -119,6 +119,39 @@ class Pending(unittest.TestCase):
         with open(os.path.join(self.node.root, "state", "runner.json")) as f:
             self.assertIn(900, json.load(f)["halts_seen"])
 
+    def test_past_halt_must_be_behind_the_chain(self):
+        before = self.pending_text()
+        url = self.rpc(height=1000, halt=(1200, "v2.0.0"))
+        rc, out = self.cli("--rpc", url, "--halt-height", "5000", "--min-version", "v1.9.0", "--past-halt")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("has not happened yet", out)
+        rc, out = self.cli("--rpc", "http://127.0.0.1:%d" % free_port(), "--halt-height", "77",
+                           "--min-version", "v1.9.0", "--past-halt")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("needs the chain's current height", out)
+        self.assertEqual(self.pending_text(), before)
+        self.assertFalse(os.path.exists(os.path.join(self.node.root, "state", "runner.json")))
+
+    def test_past_halt_refused_while_the_runner_runs(self):
+        from gnotools.runner import _lock
+        held = _lock(os.path.join(self.node.root, "state", "runner.lock"))
+        try:
+            before = self.pending_text()
+            rc, out = self.cli("--rpc", self.rpc(height=1000, halt=(1200, "v2.0.0")), "--halt-height", "900",
+                               "--min-version", "v1.9.0", "--past-halt")
+            self.assertEqual(rc, 1, out)
+            self.assertIn("stop it first", out)
+            self.assertEqual(self.pending_text(), before)
+        finally:
+            held.close()
+
+    def test_pending_version_must_be_newer_than_the_ledger(self):
+        led = self.cfg.load_ledger()
+        with self.assertRaises(InstallError) as ctx:
+            add_pending(self.cfg, led, "v1.7.9", 5000, "v1.7.9", "d" * 40, "https://x/g", SHA,
+                        chain_height=1000, log=lambda m: None)
+        self.assertIn("not newer than v1.8.0", str(ctx.exception))
+
     def test_bad_commit_and_url_are_refused(self):
         led = self.cfg.load_ledger()
         for commit, url in (("--upload-pack=x", "https://x/g"), ("d" * 40, "http://x/g")):

@@ -29,7 +29,7 @@ DEFAULTS = {
     "runner": {
         "poll_seconds": "5",
         "halt_grace_seconds": "20",   # after the halt line, give the node this long before stopping it
-        "halt_stall_seconds": "60",   # no halt line seen, but the height sits on a known halt this long: halted
+        "halt_stall_seconds": "60",   # no halt line seen, but the height sits this long on the chain's halt height: halted
         "stop_timeout_seconds": "90",
         "min_run_seconds": "30",      # a child that dies faster than this without progress ends the runner
         "max_switches": "50",
