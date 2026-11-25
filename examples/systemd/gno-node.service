@@ -1,0 +1,32 @@
+# /etc/systemd/system/gno-node.service
+# Runs the node through gno-node-tools, which switches binaries at every coordinated upgrade.
+# Assumes the code is in /opt/gno-node-tools and the config in /etc/gno-node-tools/onyx.ini.
+# Keep exactly one of these per validator key, on one machine: never two signers.
+
+[Unit]
+Description=gno.land node (gno-node-tools runner)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=gnoland
+Group=gnoland
+WorkingDirectory=/var/lib/gnoland
+Environment=PYTHONPATH=/opt/gno-node-tools
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 -m gnotools --config /etc/gno-node-tools/onyx.ini run
+# Restart after a crash, but not after exit code 3: those are problems a restart cannot fix
+# (missing or wrong binary, unreadable ledger, a second node already running). The runner's
+# log says what to do.
+Restart=on-failure
+RestartSec=10
+RestartPreventExitStatus=3
+# The stop signal goes to the runner, which stops the node cleanly (up to stop_timeout_seconds = 90);
+# anything still running after TimeoutStopSec is killed.
+KillMode=mixed
+TimeoutStopSec=120
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

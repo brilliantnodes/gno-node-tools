@@ -1,17 +1,26 @@
 #!/usr/bin/env python3
 """A stand-in for `gnoland` used only by the tests.
 
-It imitates the parts of gnoland the runner depends on, with the same log wording:
+It imitates the parts of gnoland the runner depends on, with the same log wording
+(checked against gno's chain/mainnet branch):
   * the startup version gates (gno.land/pkg/gnoland/node_params.go);
   * governance halts that fire during replay and at the tip (tm2 BaseApp halt + EndBlocker);
   * exit code 2 when a halt fires while syncing, and an idle process when it fires at the tip;
   * "wrong Block.Header.AppHash" when a version is used outside the blocks it can process;
-  * a /status RPC with the block height, catching_up and build_version.
+  * a /status and /abci_query RPC (height, catching_up, build_version, the halt params).
+
+Halt params follow the real chain: a halt becomes visible in state only once its GovDAO
+proposal has executed ("proposed_at", default 5 blocks before the halt, never before the
+previous halt), and the params are never cleared, so between halts they still show the
+previous halt.
 
 Chain description: JSON file in $FAKE_CHAIN. Node data (its height): JSON file in $FAKE_DATA.
 The version is read from a VERSION file next to this script.
+Test switches in the chain file: "noise_lines" (lines of non-UTF-8 output printed at start),
+"quiet_halt" (at the tip, halt without printing the halt line), "noise_per_block".
 """
 
+import base64
 import json
 import os
 import re
@@ -20,6 +29,7 @@ import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import parse_qs, unquote, urlparse
 
 HERE = os.path.dirname(os.path.abspath(sys.argv[0]))
 VERSION = open(os.path.join(HERE, "VERSION")).read().strip()
@@ -35,6 +45,25 @@ def meets(v, floor):
     return not floor or vkey(v) >= vkey(floor)
 
 
+def halts_of(chain):
+    out, prev = [], 0
+    for item in chain["halts"]:
+        x, f = int(item[0]), item[1]
+        proposed = int(item[2]) if len(item) > 2 else max(prev + 1, x - 5)
+        out.append((x, f, proposed))
+        prev = x
+    return out
+
+
+def params_at(halts, h):
+    """The halt params in committed state at height h: the last halt whose proposal executed."""
+    hh, floor = 0, ""
+    for x, f, proposed in halts:
+        if proposed <= h:
+            hh, floor = x, f
+    return hh, floor
+
+
 def main():
     if len(sys.argv) > 1 and sys.argv[1] == "version":
         print("gnoland version: %s" % VERSION)
@@ -45,13 +74,11 @@ def main():
         h = json.load(open(data_f))["height"]
     except (OSError, ValueError, KeyError):
         h = 0
-    halts = [(int(x), f) for x, f in chain["halts"]]
+    halts = halts_of(chain)
     tip = chain["tip"]
+    out = sys.stdout.buffer
 
-    # Governance params as committed state: the nearest halt at or above the height,
-    # otherwise the last halt (params are never cleared).
-    ahead = [x for x in halts if x[0] >= h]
-    hh, floor = (ahead[0] if ahead else halts[-1]) if halts else (0, "")
+    hh, floor = params_at(halts, h)
     if hh and floor:
         if h >= hh and not meets(VERSION, floor):
             print('Error: unable to create the Gnoland app, binary version "%s" does not meet the minimum '
@@ -70,11 +97,24 @@ def main():
 
     class H(BaseHTTPRequestHandler):
         def do_GET(self):
-            body = json.dumps({"jsonrpc": "2.0", "id": "", "result": {
-                "node_info": {"network": chain.get("chain_id", "test-1")},
-                "build_version": VERSION,
-                "sync_info": {"latest_block_height": str(state["h"]), "latest_block_time": "2026-11-25T10:00:00Z",
-                              "catching_up": state["h"] < tip}}}).encode()
+            u = urlparse(self.path)
+            if u.path == "/abci_query":
+                key = unquote(parse_qs(u.query).get("path", [""])[0]).strip('"')
+                ph, pf = params_at(halts, state["h"])
+                val = None
+                if key == "params/node:p:halt_height" and ph:
+                    val = json.dumps(str(ph))
+                elif key == "params/node:p:halt_min_version" and pf:
+                    val = json.dumps(pf)
+                data = base64.b64encode(val.encode()).decode() if val else None
+                res = {"response": {"ResponseBase": {"Error": None, "Data": data}}}
+            else:
+                res = {"node_info": {"network": chain.get("chain_id", "test-1")},
+                       "build_version": VERSION,
+                       "sync_info": {"latest_block_height": str(state["h"]),
+                                     "latest_block_time": "2026-11-25T10:00:00Z",
+                                     "catching_up": state["h"] < tip}}
+            body = json.dumps({"jsonrpc": "2.0", "id": "", "result": res}).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
@@ -90,6 +130,9 @@ def main():
         state["stop"] = True
     signal.signal(signal.SIGTERM, on_term)
     print("starting node %s at height %d" % (VERSION, h), flush=True)
+    for i in range(int(chain.get("noise_lines", 0))):
+        out.write(b"debug \xff\xfe not utf-8 " + (b"x" * 200) + b" %d\n" % i)
+    out.flush()
 
     armed = None
     while not state["stop"]:
@@ -100,7 +143,8 @@ def main():
                 print("panic: " + msg, flush=True)
                 srv.shutdown()
                 return 2
-            print('CONSENSUS FAILURE!!!  err="%s"' % msg, flush=True)
+            if not chain.get("quiet_halt"):
+                print('CONSENSUS FAILURE!!!  err="%s"' % msg, flush=True)
             while not state["stop"]:       # the process stays up at the tip
                 time.sleep(0.05)
             break
@@ -113,7 +157,10 @@ def main():
         state["h"] = nxt
         json.dump({"height": nxt}, open(data_f + ".tmp", "w"))
         os.replace(data_f + ".tmp", data_f)
-        for x, _f in halts:
+        for i in range(int(chain.get("noise_per_block", 0))):
+            out.write(b"debug \xc3\x28 block %d line %d " % (nxt, i) + (b"y" * 300) + b"\n")
+        out.flush()
+        for x, _f, _p in halts:
             if x == nxt:
                 print("GovDAO halt height reached, will halt after this block height=%d halt_height=%d" % (x, x),
                       flush=True)

@@ -137,10 +137,22 @@ class Preflight(Base):
         self.assertEqual(self.levels()["halt"], "warn")
 
     def test_halt_with_binary_installed_but_not_recorded(self):
+        # Close to the halt this is a failure: the runner would restart the old binary at the halt.
         self.node.add_version("v1.9.0")
         self.local.s["halt"] = (5000, "v1.9.0")
-        self.assertEqual(self.levels()["halt"], "warn")
+        self.assertEqual(self.levels()["halt"], "fail")
         self.assertIn("install --pending", self.texts()["halt"])
+
+    def test_halt_far_ahead_installed_but_not_recorded_is_a_warning(self):
+        self.node.add_version("v1.9.0")
+        self.local.s["halt"] = (500000, "v1.9.0")
+        self.assertEqual(self.levels()["halt"], "warn")
+
+    def test_past_halt_params_are_not_a_scheduled_halt(self):
+        # The params are never cleared: after an upgrade they still show the last halt.
+        self.local.s["halt"] = (30, "v1.8.0")
+        self.assertEqual(self.levels()["halt"], "ok")
+        self.assertIn("none scheduled ahead", self.texts()["halt"])
 
     def test_config_halt_height_trap(self):
         with open(self.toml, "w") as f:
@@ -198,13 +210,40 @@ class Watch(Base):
         self.assertEqual(len(self.sent), 1)                    # no "recovered" message by default
 
     def test_stall(self):
+        # This node is stuck while the network moves on (by less than the lag limit).
         self.ref.s["height"] = self.local.s["height"]
         self.run_check(1000)
+        self.ref.s["height"] += 10
         self.run_check(1000 + 10 * 60)
         self.assertEqual(self.sent, [])
+        self.ref.s["height"] += 10
         self.run_check(1000 + 16 * 60)
         self.assertEqual(len(self.sent), 1)
         self.assertIn("block height stuck at 1000", self.sent[0])
+        self.assertIn("the reference node is at 1020", self.sent[0])
+
+    def test_network_wide_stall_is_quiet(self):
+        # A coordinated halt: the reference node has stopped at the same height. No alert.
+        self.ref.s["height"] = self.local.s["height"]
+        for t in (1000, 1000 + 10 * 60, 1000 + 16 * 60, 1000 + 40 * 60):
+            self.run_check(t)
+        self.assertEqual(self.sent, [])
+
+    def test_stall_without_reference_alerts(self):
+        self.cfg.cp.set("watch", "reference_rpc", "")
+        self.run_check(1000)
+        self.run_check(1000 + 16 * 60)
+        self.assertEqual(len(self.sent), 1)
+        self.assertIn("block height stuck at 1000", self.sent[0])
+
+    def test_reference_down_does_not_alert(self):
+        self.ref.close()
+        for i in range(4):
+            self.local.s["height"] += 10
+            self.run_check(1000 + 300 * i)
+        self.assertEqual(self.sent, [])
+        self.assertEqual(self.levels()["reference"], "warn")
+        self.ref = FakeRPC()   # tearDown closes it
 
     def test_node_down(self):
         self.local.close()

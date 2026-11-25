@@ -22,6 +22,21 @@ def free_port():
     return p
 
 
+def wait_port_closed(port, timeout=10):
+    end = time.time() + timeout
+    while time.time() < end:
+        s = socket.socket()
+        s.settimeout(0.5)
+        try:
+            s.connect(("127.0.0.1", port))
+        except OSError:
+            return True
+        finally:
+            s.close()
+        time.sleep(0.2)
+    return False
+
+
 def sha(path):
     with open(path, "rb") as f:
         return hashlib.sha256(f.read()).hexdigest()

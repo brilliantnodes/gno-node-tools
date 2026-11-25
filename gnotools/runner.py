@@ -5,11 +5,18 @@ Meant to be the ExecStart of a systemd unit. It:
   * starts that version, checking its SHA-256 first, with GNOROOT at its own release checkout;
   * follows the node's height over RPC and in the node's own log lines;
   * when the node reaches a halt height, stops it if it is still running (at the chain tip the
-    process stays up after a halt) and starts the version for the next block;
-  * refuses to start while another node already answers on the RPC port, and holds a lock so
-    two runners cannot start two copies of the same validator.
+    process stays up after a halt) and starts the version for the next block. The halt is seen
+    either in the node's log ("halt height N reached") or, if no such line arrives, from the
+    RPC height sitting on a known halt height for `halt_stall_seconds`;
+  * starts a binary recorded only in the local pending file only once the chain itself confirms
+    that halt height (the chain's halt param, or a halt this runner saw happen);
+  * refuses to start while another node already answers on the RPC port, and holds locks in the
+    state directory and the node home so two runners cannot start two copies of one validator.
 
 It never edits config.toml and never sets a halt height itself: halts come from governance.
+
+Exit codes: 0 after a stop signal; 3 (EXIT_STOP) for problems a restart cannot fix, so systemd
+can be told not to restart (RestartPreventExitStatus=3); otherwise the node's own exit code or 1.
 """
 
 import fcntl
@@ -24,8 +31,9 @@ import threading
 import time
 
 from . import rpc
+from .config import EXIT_STOP, ConfigError
 from .install import sha256_file, installed_versions
-from .ledger import Ledger, choose_version, parse_plan
+from .ledger import LedgerError, choose_version, parse_plan
 
 HALT_RE = re.compile(r"halt height (\d+) reached")
 GOV_HALT_RE = re.compile(r"GovDAO halt height reached.*?halt_height[=\":\s]+(\d+)")
@@ -41,7 +49,8 @@ def state_path(cfg):
 def load_state(cfg):
     try:
         with open(state_path(cfg), encoding="utf-8") as f:
-            return json.load(f)
+            st = json.load(f)
+        return st if isinstance(st, dict) else {}
     except (OSError, ValueError):
         return {}
 
@@ -59,6 +68,20 @@ def data_present(cfg):
     return os.path.isdir(db) and bool(os.listdir(db))
 
 
+def _lock(path):
+    """Take an exclusive lock on `path`; return the open file (keep it open) or None if taken."""
+    d = os.path.dirname(path)
+    if d:
+        os.makedirs(d, exist_ok=True)
+    f = open(path, "a")
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        f.close()
+        return None
+    return f
+
+
 class Runner:
     def __init__(self, cfg, log=None):
         self.cfg = cfg
@@ -68,17 +91,31 @@ class Runner:
         self.lock = threading.Lock()
         self.st = load_state(cfg)
         self.height = self.st.get("height")
+        ch = self.st.get("chain_halt")
+        self.chain_halt = tuple(ch) if isinstance(ch, list) and len(ch) == 2 else None
+        self._save_failed = False
         self._reset_run()
 
     def _reset_run(self):
-        self.halted_at = None
-        self.halted_seen_t = None
+        self.halt = None          # (height, time seen), set in one assignment
         self.too_new = None       # (halt_height, chain_height)
         self.too_old = None       # floor version
         self.apphash = False
         self.progress = False
+        self.rpc_h = None         # last RPC height and when it last changed
+        self.rpc_h_t = None
+        self.rpc_catching_up = True
 
-    # ---- height bookkeeping -------------------------------------------------------------
+    # ---- state ---------------------------------------------------------------------------
+    def _save(self):
+        try:
+            save_state(self.cfg, self.st)
+            self._save_failed = False
+        except OSError as e:
+            if not self._save_failed:
+                self.log("cannot write the state file (%s); carrying on" % e)
+            self._save_failed = True
+
     def _note_height(self, h, source, authoritative=False):
         with self.lock:
             if h is None:
@@ -88,45 +125,83 @@ class Runner:
                     self.progress = True
                 self.height = h
                 self.st.update({"height": h, "height_source": source, "updated": int(time.time())})
-                save_state(self.cfg, self.st)
+                self._save()
 
     # ---- child output and polling --------------------------------------------------------
+    def _parse(self, line):
+        m = HALT_RE.search(line)
+        if m:
+            h = int(m.group(1))
+            self.halt = (h, time.time())
+            self._note_height(h, "halt line")
+            return
+        m = GOV_HALT_RE.search(line)
+        if m:
+            self.log("node announced the governance halt at %s" % m.group(1))
+            return
+        m = TOO_NEW_RE.search(line)
+        if m:
+            self.too_new = (int(m.group(1)), int(m.group(2)))
+            self._note_height(int(m.group(2)), "refusal line", authoritative=True)
+            return
+        m = TOO_OLD_RE.search(line)
+        if m:
+            self.too_old = m.group(1)
+            return
+        if APPHASH_RE.search(line):
+            self.apphash = True
+
     def _reader(self, stream):
-        for line in iter(stream.readline, ""):
-            sys.stdout.write(line)
-            sys.stdout.flush()
-            m = HALT_RE.search(line)
-            if m:
-                h = int(m.group(1))
-                self.halted_at = h
-                self.halted_seen_t = time.time()
-                self._note_height(h, "halt line")
-                continue
-            m = GOV_HALT_RE.search(line)
-            if m:
-                self.log("node announced the governance halt at %s" % m.group(1))
-                continue
-            m = TOO_NEW_RE.search(line)
-            if m:
-                self.too_new = (int(m.group(1)), int(m.group(2)))
-                self._note_height(int(m.group(2)), "refusal line", authoritative=True)
-                continue
-            m = TOO_OLD_RE.search(line)
-            if m:
-                self.too_old = m.group(1)
-                continue
-            if APPHASH_RE.search(line):
-                self.apphash = True
-        stream.close()
+        """Copy the node's output to our stdout and watch it for known lines.
+
+        The node writes into a pipe; if nothing drains it, the node blocks on its next log write.
+        So this loop must never die: bytes are decoded leniently and every per-line failure is
+        caught. Writing to our own stdout is best effort."""
+        out = getattr(sys.stdout, "buffer", None)
+        complained = False
+        try:
+            for raw in iter(stream.readline, b""):
+                try:
+                    if out is not None:
+                        out.write(raw)
+                        out.flush()
+                    else:
+                        sys.stdout.write(raw.decode("utf-8", "replace"))
+                        sys.stdout.flush()
+                except Exception:
+                    pass
+                try:
+                    self._parse(raw.decode("utf-8", "replace"))
+                except Exception as e:
+                    if not complained:
+                        self.log("could not parse a node log line (%s); still reading" % e)
+                        complained = True
+        except Exception as e:
+            self.log("reading the node's output failed (%s)" % e)
+        finally:
+            try:
+                stream.close()
+            except Exception:
+                pass
 
     def _poller(self, child):
-        every = self.cfg.getint("runner", "poll_seconds")
+        every = max(1, self.cfg.getint("runner", "poll_seconds"))
         base = self.cfg.get("node", "rpc")
         while child.poll() is None and not self.stopping:
             try:
                 s = rpc.status(base, timeout=4)
+                now = time.time()
+                if s["height"] != self.rpc_h:
+                    self.rpc_h, self.rpc_h_t = s["height"], now
+                self.rpc_catching_up = s["catching_up"]
                 self._note_height(s["height"], "rpc")
-            except rpc.RPCError:
+                hh, floor = rpc.scheduled_halt(base, timeout=4)
+                if hh and (hh, floor) != self.chain_halt:
+                    self.chain_halt = (hh, floor)
+                    with self.lock:
+                        self.st["chain_halt"] = [hh, floor]
+                        self._save()
+            except Exception:
                 pass
             time.sleep(every)
 
@@ -160,72 +235,139 @@ class Runner:
         env = dict(os.environ, GNOROOT=os.path.join(vdir, "gno"))
         self.log("starting %s for block %s (hash ok): %s" % (version, (self.height or 0) + 1, " ".join(cmd[1:])))
         self.st.update({"version": version, "started": int(time.time())})
-        save_state(self.cfg, self.st)
+        self._save()
         return subprocess.Popen(cmd, cwd=self.cfg.home, env=env, stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT, text=True, bufsize=1)
+                                stderr=subprocess.STDOUT, bufsize=0)
+
+    def _reference_halt(self):
+        ref = self.cfg.get("watch", "reference_rpc")
+        if not ref:
+            return None
+        try:
+            return rpc.scheduled_halt(ref)
+        except rpc.RPCError:
+            return None
+
+    def _pending_confirmed(self, entry):
+        """A binary known only from the local pending file starts only if the chain agrees on its halt."""
+        h = entry.get("halt_height")
+        if self.chain_halt and self.chain_halt[0] == h:
+            return True, "the chain's halt param is %d" % h
+        if self.st.get("last_halt") == h and self.height is not None and self.height >= h:
+            return True, "this runner saw the chain halt at %d" % h
+        ref = self._reference_halt()
+        if ref and ref[0] == h:
+            return True, "the reference RPC's halt param is %d" % h
+        seen = self.chain_halt[0] if self.chain_halt else (ref[0] if ref else "unknown")
+        return False, "the chain does not confirm halt %d (last halt param seen: %s)" % (h, seen)
 
     # ---- main loop -----------------------------------------------------------------------
     def run(self):
-        os.makedirs(self.cfg.state_dir, exist_ok=True)
-        lockf = open(os.path.join(self.cfg.state_dir, "runner.lock"), "w")
         try:
-            fcntl.flock(lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            self.log("another runner holds the lock in %s; not starting a second node" % self.cfg.state_dir)
-            return 1
+            return self._run()
+        except (ConfigError, LedgerError, ValueError) as e:
+            self.log("configuration problem: %s" % e)
+            self._terminate("configuration problem")
+            return EXIT_STOP
+
+    def _run(self):
+        locks = []
+        for path in (os.path.join(self.cfg.state_dir, "runner.lock"),
+                     os.path.join(self.cfg.home, ".gno-runner.lock")):
+            f = _lock(path)
+            if f is None:
+                self.log("another runner holds the lock %s; not starting a second node" % path)
+                return EXIT_STOP
+            locks.append(f)
         try:
             rpc.status(self.cfg.get("node", "rpc"), timeout=3)
             self.log("a node already answers on %s; stop it before starting the runner" % self.cfg.get("node", "rpc"))
-            return 1
+            return EXIT_STOP
         except rpc.RPCError:
             pass
+        self.cfg.start_args()      # fail early on a bad start_args
 
         if self.height is None:
             if data_present(self.cfg):
                 self.log("the node already has chain data but the runner has no record of its height. "
-                         "Run `gno-tools state --set-height N` (or `--from-rpc` while the old node still runs).")
-                return 1
+                         "Run `python3 -m gnotools state --set-height N` (or `--from-rpc` while the old node "
+                         "still runs).")
+                return EXIT_STOP
             self._note_height(0, "empty data directory", authoritative=True)
 
         signal.signal(signal.SIGTERM, self._on_signal)
         signal.signal(signal.SIGINT, self._on_signal)
         plan = parse_plan(self.cfg.get("node", "plan"))
         grace = self.cfg.getint("runner", "halt_grace_seconds")
+        stall = self.cfg.getint("runner", "halt_stall_seconds")
         min_run = self.cfg.getint("runner", "min_run_seconds")
         last_version, last_outcome = None, None
 
         for _ in range(self.cfg.getint("runner", "max_switches")):
             if self.stopping:
                 return 0
-            ledger = Ledger.load(self.cfg.get("node", "ledger"), self.cfg.get("node", "pending") or None)
+            try:
+                ledger = self.cfg.load_ledger(log=self.log)
+            except (OSError, ValueError, LedgerError) as e:
+                self.log("cannot read the ledger (%s); not starting a node" % e)
+                return EXIT_STOP
             installed = {v for v, i in installed_versions(self.cfg).items() if not i.get("broken")}
             version, reason = choose_version(ledger, self.height + 1, installed, plan)
             if version is None:
                 self.log(reason)
-                return 1
+                return EXIT_STOP
             self.log(reason)
+            entry = ledger.entry(version) or {}
+            if entry.get("pending") and entry.get("kind") == "upgrade":
+                ok, why = self._pending_confirmed(entry)
+                if not ok:
+                    self.log("%s comes only from the pending file and %s; not starting it. Check the halt height "
+                             "you recorded." % (version, why))
+                    return EXIT_STOP
+                self.log("%s (pending) confirmed: %s" % (version, why))
             if version == last_version and last_outcome == "too_new":
                 self.log("%s was refused before its halt and no older version is installed for block %d; "
                          "install the previous version" % (version, self.height + 1))
-                return 1
+                return EXIT_STOP
 
             self._reset_run()
+            known_halts = ledger.halt_heights() | ({self.chain_halt[0]} if self.chain_halt else set())
             started = time.time()
             try:
                 self.child = self._start(version)
-            except (OSError, RuntimeError) as e:
+            except (OSError, RuntimeError, ConfigError) as e:
                 self.log(str(e))
-                return 1
+                return EXIT_STOP
+            if self.stopping:              # a stop signal arrived while we were starting it
+                self._terminate("stop requested during start")
+                return 0
             reader = threading.Thread(target=self._reader, args=(self.child.stdout,), daemon=True)
             poller = threading.Thread(target=self._poller, args=(self.child,), daemon=True)
             reader.start()
             poller.start()
 
+            reader_gone_t = None
             while self.child.poll() is None:
-                if self.halted_at is not None and time.time() - self.halted_seen_t >= grace:
+                now = time.time()
+                halt = self.halt
+                if halt is not None and now - halt[1] >= grace:
                     # At the chain tip the node keeps running after a halt; stop it ourselves.
-                    self._terminate("halted at block %d" % self.halted_at)
+                    self._terminate("halted at block %d" % halt[0])
                     break
+                if (halt is None and self.rpc_h in known_halts and self.rpc_h_t is not None
+                        and not self.rpc_catching_up and now - self.rpc_h_t >= stall):
+                    self.log("no halt line seen, but the height has stayed at the known halt height %d for %ds"
+                             % (self.rpc_h, now - self.rpc_h_t))
+                    self.halt = (self.rpc_h, now)
+                    self._note_height(self.rpc_h, "rpc at halt")
+                    self._terminate("halted at block %d" % self.rpc_h)
+                    break
+                if not reader.is_alive():
+                    reader_gone_t = reader_gone_t or now
+                    if now - reader_gone_t >= 5:
+                        self.log("the node's output is no longer being read; stopping it so it cannot block")
+                        self._terminate("output reader stopped")
+                        break
                 time.sleep(0.2)
             rc = self.child.wait()
             reader.join(timeout=5)
@@ -234,9 +376,9 @@ class Runner:
 
             if self.stopping:
                 return 0
-            if self.halted_at is not None:
-                self.st["last_halt"] = self.halted_at
-                save_state(self.cfg, self.st)
+            if self.halt is not None:
+                self.st["last_halt"] = self.halt[0]
+                self._save()
                 last_version, last_outcome = version, "halt"
                 continue
             if self.too_new is not None:
@@ -246,18 +388,18 @@ class Runner:
                 continue
             if self.too_old is not None:
                 self.log("%s is below the governance minimum %s: the chain is past a halt this runner does not "
-                         "know. Install that version and record it (`gno-tools install --pending`)." % (
+                         "know. Install that version and record it (`python3 -m gnotools install --pending`)." % (
                              version, self.too_old))
-                return 1
+                return EXIT_STOP
             if self.apphash:
                 self.log("%s cannot process block %d (wrong AppHash): it is the wrong binary for this range. "
                          "Check the ledger or the replay plan." % (version, self.height + 1))
-                return 1
+                return EXIT_STOP
             if ran < min_run and not self.progress:
                 self.log("the node stopped quickly without making progress; leaving the restart to systemd")
             return rc if rc else 1
         self.log("too many binary switches in one run; stopping")
-        return 1
+        return EXIT_STOP
 
 
 def set_height(cfg, height=None, from_rpc=False, log=print):

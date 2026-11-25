@@ -1,0 +1,13 @@
+# /etc/systemd/system/gno-watch.service
+# One watch check. Started every 5 minutes by gno-watch.timer.
+
+[Unit]
+Description=gno.land node watch (alerts only on confirmed problems)
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=gnoland
+Group=gnoland
+Environment=PYTHONPATH=/opt/gno-node-tools
+ExecStart=/usr/bin/python3 -m gnotools --config /etc/gno-node-tools/onyx.ini watch

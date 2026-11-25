@@ -11,10 +11,13 @@ has been voted but not reached) in a local "pending" file with the same fields.
 """
 
 import json
+import os
 import re
+import tempfile
 import urllib.request
 
 _SEMVER = re.compile(r"^v(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$")
+COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 
 
 class LedgerError(Exception):
@@ -49,14 +52,37 @@ def meets_min_version(binary, floor):
     return a >= b
 
 
+def is_url(source):
+    return source.startswith("https://") or source.startswith("http://")
+
+
 def load_json(source, timeout=30):
-    """Load JSON from a local path or an https:// URL."""
-    if source.startswith("https://") or source.startswith("http://"):
+    """Load JSON from a local path or an https:// URL. Plain http:// is refused: the ledger
+    carries the checksums of every binary, so it must not be open to tampering in transit."""
+    if source.startswith("http://"):
+        raise LedgerError("refusing to load %s over plain http; use https:// or a local file" % source)
+    if source.startswith("https://"):
         req = urllib.request.Request(source, headers={"User-Agent": "gno-node-tools"})
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return json.loads(r.read().decode("utf-8"))
     with open(source, encoding="utf-8") as f:
         return json.load(f)
+
+
+def write_json(path, obj, mode=0o644):
+    """Write JSON atomically (temp file + rename), readable by the service user."""
+    d = os.path.dirname(path) or "."
+    os.makedirs(d, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".tmp-", dir=d)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(obj, f, indent=2, sort_keys=True)
+            f.write("\n")
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
 
 
 def binary_for(entry, platform):
@@ -90,6 +116,7 @@ class Ledger:
     def __init__(self, data, pending=None):
         self.chain_id = data.get("chain_id")
         self.genesis_sha256 = (data.get("genesis_sha256") or "").lower()
+        self.from_cache = False
         entries = list(data.get("upgrades") or [])
         known = {e.get("version") for e in entries}
         for p in pending or []:
@@ -103,15 +130,36 @@ class Ledger:
         self.eras = self._eras()
 
     @classmethod
-    def load(cls, source, pending_file=None):
-        data = load_json(source)
+    def load(cls, source, pending_file=None, cache=None, log=None):
+        """Load the ledger. For an https:// source, a good copy is saved to `cache`; if the
+        source cannot be fetched or read later (GitHub down at upgrade time), the cached copy
+        is used instead, so an upgrade never depends on the network."""
+        if not source:
+            raise LedgerError("no ledger configured: set [node] ledger")
+        from_cache = False
+        if is_url(source) and cache:
+            try:
+                data = load_json(source)
+                cls(data)   # validate before caching
+                write_json(cache, data)
+            except Exception as e:
+                if not os.path.isfile(cache):
+                    raise
+                if log:
+                    log("could not use the ledger at %s (%s); using the cached copy %s" % (source, e, cache))
+                data = load_json(cache)
+                from_cache = True
+        else:
+            data = load_json(source)
         pending = []
         if pending_file:
             try:
                 pending = load_json(pending_file).get("pending", [])
             except FileNotFoundError:
                 pending = []
-        return cls(data, pending)
+        led = cls(data, pending)
+        led.from_cache = from_cache
+        return led
 
     def _validate(self):
         if not self.entries:
@@ -132,11 +180,14 @@ class Ledger:
                 raise LedgerError("only the first entry may be the genesis")
             if kind == "upgrade":
                 h = e.get("halt_height")
-                if not isinstance(h, int) or h <= last_h:
+                if not isinstance(h, int) or isinstance(h, bool) or h <= last_h:
                     raise LedgerError("halt heights must strictly increase: %s at %r" % (v, h))
                 last_h = h
             if kind == "rolling" and e.get("halt_height"):
                 raise LedgerError("a rolling release has no halt height: %s" % v)
+            c = e.get("commit")
+            if c and not COMMIT_RE.match(c):
+                raise LedgerError("commit of %s is not a 40-character hex hash: %r" % (v, c))
             last_v = v
 
     def _eras(self):
@@ -164,6 +215,15 @@ class Ledger:
                 return e
         return None
 
+    def halt_heights(self):
+        """Every coordinated halt height the ledger (and the pending file) knows."""
+        return {era.end for era in self.eras if era.end is not None}
+
+    def last_halt(self, include_pending=True):
+        hs = [e["halt_height"] for e in self.entries
+              if e.get("kind") == "upgrade" and (include_pending or not e.get("pending"))]
+        return max(hs) if hs else 0
+
     def next_halt_after(self, height):
         """The first known halt height at or after `height`, or None."""
         for era in self.eras:
@@ -185,7 +245,11 @@ def parse_plan(text):
         if ":" not in item:
             raise LedgerError("plan item %r must look like HEIGHT:VERSION" % item)
         h, v = item.split(":", 1)
-        h, v = int(h.strip()), v.strip()
+        try:
+            h = int(h.strip())
+        except ValueError:
+            raise LedgerError("plan item %r must look like HEIGHT:VERSION" % item)
+        v = v.strip()
         if parse_version(v) is None:
             raise LedgerError("plan version %r does not parse" % v)
         plan.append((h, v))

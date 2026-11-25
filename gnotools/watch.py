@@ -1,6 +1,9 @@
 """gno-tools watch: check the node and alert only when something is definitely wrong.
 
-A problem must be seen on `confirm_checks` checks in a row before one alert goes out.
+A problem must be seen on `confirm_checks` checks in a row before one alert goes out
+(a stalled height is the exception: it already takes `stall_minutes` to count as a problem,
+and it is not alerted when the reference node has stopped at the same height, as every node
+does during a coordinated upgrade halt).
 An open problem is repeated every `repeat_hours`. Nothing is sent when things are fine,
 when the watch starts, or when a problem clears (unless `send_resolved = true`).
 Run it from a systemd timer (examples/systemd/gno-watch.timer) or cron.
@@ -61,8 +64,35 @@ def problems(cfg, st, now):
         if h != st.get("h"):
             st["h"], st["h_t"] = h, now
         elif st.get("h_t") and now - st["h_t"] >= 60 * cfg.getint("watch", "stall_minutes"):
-            found["stall"] = "block height stuck at %d for %d min" % (h, (now - st["h_t"]) // 60)
+            mins = (now - st["h_t"]) // 60
+            ref_h = _reference_height(cfg)
+            if ref_h is not None and ref_h <= h:
+                # The whole network is stopped (for example at a coordinated upgrade halt): every node
+                # stalls together, so this node is not at fault. Logged, not alerted.
+                st["network_stall"] = "network stopped at %d for %d min (reference node at %d)" % (h, mins, ref_h)
+            else:
+                where = " (a governance halt height)" if _is_halt(cfg, h) else ""
+                ahead = "; the reference node is at %d" % ref_h if ref_h is not None else ""
+                found["stall"] = "block height stuck at %d%s for %d min%s" % (h, where, mins, ahead)
+                st.pop("network_stall", None)
     return found, status
+
+
+def _reference_height(cfg):
+    ref = cfg.get("watch", "reference_rpc")
+    if not ref:
+        return None
+    try:
+        return rpc.status(ref)["height"]
+    except rpc.RPCError:
+        return None
+
+
+def _is_halt(cfg, h):
+    try:
+        return h in cfg.load_ledger().halt_heights()
+    except Exception:
+        return False
 
 
 def check_once(cfg, now=None, send=None, log=print):

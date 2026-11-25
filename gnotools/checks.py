@@ -1,6 +1,7 @@
-"""Read-only checks shared by `gno-tools preflight` and `gno-tools watch`.
+"""Read-only checks shared by `preflight` and `watch`.
 
 Each check returns Result(level, key, text): level is "ok", "warn" or "fail".
+Nothing on the node is changed; the only file written is the ledger cache in the state directory.
 """
 
 import datetime
@@ -11,7 +12,8 @@ from collections import namedtuple
 
 from . import rpc
 from .install import installed_versions, sha256_file
-from .ledger import Ledger, LedgerError, choose_version, meets_min_version, parse_plan
+from .config import ConfigError
+from .ledger import LedgerError, choose_version, meets_min_version, parse_plan
 from .runner import load_state
 
 Result = namedtuple("Result", "level key text")
@@ -75,16 +77,18 @@ def run_checks(cfg, local_status=None):
 
     # Ledger
     try:
-        ledger = Ledger.load(cfg.get("node", "ledger"), cfg.get("node", "pending") or None)
+        ledger = cfg.load_ledger()
         plan = parse_plan(cfg.get("node", "plan"))
-    except (OSError, ValueError, LedgerError) as e:
+    except (OSError, ValueError, LedgerError, ConfigError) as e:
         add("fail", "ledger", "cannot read the ledger: %s" % e)
         return out
     want_chain = cfg.get("node", "chain_id")
     if want_chain and ledger.chain_id != want_chain:
         add("fail", "ledger", "ledger is for %s, config says %s" % (ledger.chain_id, want_chain))
     else:
-        add("ok", "ledger", "ledger for %s: %d entries, %d ranges" % (ledger.chain_id, len(ledger.entries), len(ledger.eras)))
+        add("warn" if ledger.from_cache else "ok", "ledger", "ledger for %s: %d entries, %d ranges%s" % (
+            ledger.chain_id, len(ledger.entries), len(ledger.eras),
+            " (from the local cache: the ledger URL could not be read)" if ledger.from_cache else ""))
 
     # Local node
     st = local_status
@@ -139,7 +143,10 @@ def run_checks(cfg, local_status=None):
                     lvl = "fail" if blocks <= cfg.getint("watch", "halt_warn_blocks") else "warn"
                     add(lvl, "halt", "governance halt at %d in %d blocks%s needs %s or newer: not installed" % (hh, blocks, eta, floor))
                 elif floor and not recorded:
-                    add("warn", "halt", "governance halt at %d in %d blocks%s: %s installed but not recorded; "
+                    # The binary is there but the runner does not know this halt: at the halt it would
+                    # restart the old binary, which the node then refuses. Fail when the halt is close.
+                    lvl = "fail" if blocks <= cfg.getint("watch", "halt_warn_blocks") else "warn"
+                    add(lvl, "halt", "governance halt at %d in %d blocks%s: %s installed but not recorded; "
                         "run `gno-tools install --pending` so the runner switches to it" % (hh, blocks, eta, ", ".join(sorted(after))))
                 else:
                     add("ok", "halt", "governance halt at %d in %d blocks%s; binary for after it is ready (%s)" % (
@@ -189,5 +196,6 @@ def run_checks(cfg, local_status=None):
             lvl = "warn" if lag > cfg.getint("watch", "max_lag_blocks") else "ok"
             add(lvl, "lag", "%d blocks behind the reference node (%s)" % (max(lag, 0), r["build_version"] or "?"))
         except rpc.RPCError as e:
-            add("warn", "lag", "reference RPC not answering (%s)" % e)
+            # Someone else's outage: reported, but under its own key so the watch never pages on it.
+            add("warn", "reference", "reference RPC not answering (%s)" % e)
     return out

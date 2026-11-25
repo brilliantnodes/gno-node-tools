@@ -9,14 +9,14 @@ Layout under <root>/versions/<tag>/:
 
 import datetime
 import hashlib
-import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
 import urllib.request
 
-from .ledger import binary_for, load_json
+from .ledger import COMMIT_RE, Ledger, LedgerError, binary_for, load_json, parse_version, write_json
 
 
 class InstallError(Exception):
@@ -37,7 +37,23 @@ def _download(url, dest, timeout=600):
         shutil.copyfileobj(r, f, 1 << 20)
 
 
+def _check_version_tag(version):
+    if parse_version(version) is None:
+        raise InstallError("version %r is not a vMAJOR.MINOR.PATCH tag" % version)
+
+
+def _check_commit(commit):
+    if commit and not COMMIT_RE.match(commit):
+        raise InstallError("commit %r is not a 40-character lowercase hex hash" % commit)
+
+
+def _check_sha256(sha256):
+    if not re.match(r"^[0-9a-f]{64}$", (sha256 or "").lower()):
+        raise InstallError("sha256 %r is not a 64-character hex hash" % sha256)
+
+
 def version_dir(cfg, version):
+    _check_version_tag(version)   # the tag becomes a directory name: no "../" or other surprises
     return os.path.join(cfg.versions_dir, version)
 
 
@@ -48,6 +64,8 @@ def installed_versions(cfg, verify=True):
     if not os.path.isdir(base):
         return out
     for v in sorted(os.listdir(base)):
+        if parse_version(v) is None:
+            continue
         meta = os.path.join(base, v, "INSTALLED.json")
         binp = os.path.join(base, v, "gnoland")
         if not (os.path.isfile(meta) and os.path.isfile(binp)):
@@ -56,8 +74,12 @@ def installed_versions(cfg, verify=True):
             info = load_json(meta)
         except (OSError, ValueError):
             continue
-        if verify and sha256_file(binp) != info.get("sha256"):
-            info["broken"] = "binary hash no longer matches %s" % info.get("sha256")
+        if verify:
+            try:
+                if sha256_file(binp) != info.get("sha256"):
+                    info["broken"] = "binary hash no longer matches %s" % info.get("sha256")
+            except OSError as e:
+                info["broken"] = "binary cannot be read (%s)" % e
         out[v] = info
     return out
 
@@ -75,23 +97,46 @@ def _git(args, cwd=None):
 
 def checkout_gnoroot(cfg, commit, dest):
     """Shallow checkout of one commit of the gno repo into dest; verified by commit hash."""
+    _check_commit(commit)
     if os.path.isdir(os.path.join(dest, ".git")):
-        if _git(["rev-parse", "HEAD"], cwd=dest) == commit:
+        try:
+            head = _git(["rev-parse", "HEAD"], cwd=dest)
+        except InstallError:
+            head = None          # an earlier attempt failed half-way: start again
+        if head == commit:
             return
-        raise InstallError("%s holds a different commit; move it away first" % dest)
+        if head is not None:
+            raise InstallError("%s holds commit %s, not %s; move it away first" % (dest, head, commit))
+        shutil.rmtree(dest)
+    created = not os.path.exists(dest)
     os.makedirs(dest, exist_ok=True)
-    _git(["init", "-q"], cwd=dest)
-    _git(["remote", "add", "origin", cfg.get("node", "gno_repo")], cwd=dest)
-    _git(["fetch", "-q", "--depth", "1", "origin", commit], cwd=dest)
-    _git(["checkout", "-q", "FETCH_HEAD"], cwd=dest)
-    got = _git(["rev-parse", "HEAD"], cwd=dest)
-    if got != commit:
-        raise InstallError("GNOROOT checkout is at %s, expected %s" % (got, commit))
+    try:
+        _git(["init", "-q"], cwd=dest)
+        _git(["remote", "add", "origin", cfg.get("node", "gno_repo")], cwd=dest)
+        _git(["fetch", "-q", "--depth", "1", "origin", commit], cwd=dest)
+        _git(["checkout", "-q", "FETCH_HEAD"], cwd=dest)
+        got = _git(["rev-parse", "HEAD"], cwd=dest)
+        if got != commit:
+            raise InstallError("GNOROOT checkout is at %s, expected %s" % (got, commit))
+    except Exception:
+        if created:
+            shutil.rmtree(dest, ignore_errors=True)
+        raise
+
+
+def reported_version(output):
+    """The tag in `gnoland version` output ("gnoland version: v1.8.0-rc.1"), or ''."""
+    for line in output.splitlines():
+        m = re.match(r"^\s*gnoland version:\s*(\S+)\s*$", line)
+        if m:
+            return m.group(1)
+    return ""
 
 
 def install_version(cfg, ledger, version, url=None, sha256=None, commit=None,
                     check_version=True, log=print):
     """Install one version. Values not given are taken from the ledger (or the pending file)."""
+    _check_version_tag(version)
     entry = ledger.entry(version) if ledger else None
     if entry is None and not (url and sha256 and commit):
         raise InstallError("%s is not in the ledger; give --url, --sha256 and --commit" % version)
@@ -100,6 +145,8 @@ def install_version(cfg, ledger, version, url=None, sha256=None, commit=None,
         url, sha256, commit = url or u, (sha256 or s), commit or entry.get("commit")
     if not url or not sha256:
         raise InstallError("no %s binary for %s in the ledger" % (cfg.platform, version))
+    _check_sha256(sha256)
+    _check_commit(commit)
     sha256 = sha256.lower()
     vdir = version_dir(cfg, version)
     os.makedirs(vdir, exist_ok=True)
@@ -131,9 +178,9 @@ def install_version(cfg, ledger, version, url=None, sha256=None, commit=None,
     if check_version:
         env = dict(os.environ, GNOROOT=os.path.join(vdir, "gno"))
         r = subprocess.run([binp, "version"], capture_output=True, text=True, env=env, timeout=60)
-        reported = (r.stdout + r.stderr).strip().splitlines()[0] if (r.stdout or r.stderr) else ""
-        if version not in reported:
-            raise InstallError("%s: `gnoland version` printed %r, not the expected tag" % (version, reported))
+        reported = reported_version((r.stdout or "") + "\n" + (r.stderr or ""))
+        if reported != version:
+            raise InstallError("%s: `gnoland version` reports %r, not exactly %s" % (version, reported, version))
         log("%s: reports %s" % (version, reported))
 
     info = {
@@ -145,7 +192,7 @@ def install_version(cfg, ledger, version, url=None, sha256=None, commit=None,
         "reported_version": reported,
         "installed_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
-    _write_json(os.path.join(vdir, "INSTALLED.json"), info)
+    write_json(os.path.join(vdir, "INSTALLED.json"), info)
     return info
 
 
@@ -155,6 +202,8 @@ def install_genesis(cfg, ledger, url=None, log=print):
     want = ledger.genesis_sha256
     if not dest:
         raise InstallError("set [node] genesis to the path of genesis.json")
+    if not want:
+        raise InstallError("the ledger has no genesis_sha256 to check against")
     if os.path.isfile(dest) and sha256_file(dest) == want:
         log("genesis already present and matches %s" % want[:16])
         return
@@ -177,34 +226,64 @@ def install_genesis(cfg, ledger, url=None, log=print):
             os.unlink(tmp)
 
 
-def add_pending(cfg, version, halt_height, halt_min_version, commit, url, sha256, log=print):
-    """Record an upgrade the official ledger does not list yet, so the runner can switch to it."""
+def add_pending(cfg, ledger, version, halt_height, halt_min_version, commit, url, sha256,
+                chain_height=None, rolling=False, log=print):
+    """Record an upgrade the official ledger does not list yet, so the runner can switch to it.
+
+    Refuses anything that would make the runner start the wrong binary: a halt height at or
+    below the chain's current height or the ledger's last halt (the halt params are never
+    cleared, so the chain keeps showing the previous halt), a missing halt height for an
+    upgrade, or a floor that is not a version tag. Nothing is written unless the merged
+    ledger still validates.
+    """
     path = cfg.get("node", "pending")
     if not path:
         raise InstallError("set [node] pending to a file path first")
+    _check_version_tag(version)
+    _check_commit(commit)
+    _check_sha256(sha256)
+    if not commit:
+        raise InstallError("give --commit (the release commit, 40 hex characters)")
+    if not url or not url.startswith("https://"):
+        raise InstallError("give --url with an https:// download link")
+    if rolling:
+        if halt_height:
+            raise InstallError("a rolling release has no halt height; drop --halt-height or --rolling")
+        halt_height, halt_min_version = None, None
+    else:
+        if not halt_height or int(halt_height) <= 0:
+            raise InstallError("no halt height for %s. If the chain has no halt scheduled for it yet, wait for the "
+                               "GovDAO proposal to execute; if it is a rolling patch, pass --rolling" % version)
+        halt_height = int(halt_height)
+        last = ledger.last_halt(include_pending=False)
+        if halt_height <= last:
+            raise InstallError("halt height %d is not after the ledger's last halt %d: that halt is already "
+                               "behind the chain (the params keep showing it until a new halt is voted)"
+                               % (halt_height, last))
+        if chain_height is not None and halt_height <= chain_height:
+            raise InstallError("halt height %d is not ahead of the chain (height %d)" % (halt_height, chain_height))
+        if halt_min_version and parse_version(halt_min_version) is None:
+            raise InstallError("halt_min_version %r is not a vMAJOR.MINOR.PATCH tag" % halt_min_version)
     data = {"pending": []}
     if os.path.isfile(path):
         data = load_json(path)
     items = [p for p in data.get("pending", []) if p.get("version") != version]
     entry = {
-        "kind": "upgrade" if halt_height else "rolling",
+        "kind": "rolling" if rolling else "upgrade",
         "version": version,
         "commit": commit,
-        "halt_height": int(halt_height) if halt_height else None,
+        "halt_height": halt_height,
         "halt_min_version": halt_min_version or None,
         "binaries": {cfg.platform: "%s?checksum=sha256:%s" % (url, sha256.lower())},
     }
     items.append(entry)
+    official = {"chain_id": ledger.chain_id, "genesis_sha256": ledger.genesis_sha256,
+                "upgrades": [e for e in ledger.entries if not e.get("pending")]}
+    try:
+        Ledger(official, items)
+    except LedgerError as e:
+        raise InstallError("the pending file would not validate with this entry: %s" % e)
     data["pending"] = items
-    _write_json(path, data)
+    write_json(path, data)
     log("pending %s recorded in %s (halt height %s)" % (version, path, halt_height or "none: rolling"))
     return entry
-
-
-def _write_json(path, obj):
-    d = os.path.dirname(path) or "."
-    fd, tmp = tempfile.mkstemp(prefix=".tmp-", dir=d)
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        json.dump(obj, f, indent=2, sort_keys=True)
-        f.write("\n")
-    os.replace(tmp, path)

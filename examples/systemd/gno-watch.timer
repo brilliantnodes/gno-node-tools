@@ -1,0 +1,13 @@
+# /etc/systemd/system/gno-watch.timer
+# Enable with: systemctl enable --now gno-watch.timer
+
+[Unit]
+Description=Run the gno.land node watch every 5 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

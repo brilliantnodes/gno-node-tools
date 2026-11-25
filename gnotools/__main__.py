@@ -1,9 +1,9 @@
-"""Command line: python3 -m gnotools <command> --config node.ini
+"""Command line: python3 -m gnotools --config node.ini <command>   (or `gno-tools` once installed)
 
   plan       show which version serves which blocks, and what is installed
-  install    download and verify binaries (and GNOROOT) from the ledger
+  install    download and verify binaries (and GNOROOT) from the ledger;
+             with --pending, first record an upgrade the official ledger does not list yet
   genesis    download genesis.json and check it against the ledger hash
-  pending    record an upgrade the official ledger does not list yet
   state      show or set the height the runner starts from
   preflight  read-only checks before an upgrade (exit code 1 if anything fails)
   watch      one watch check; alerts only on confirmed problems
@@ -16,16 +16,16 @@ import sys
 
 from . import __version__, rpc
 from .checks import run_checks
-from .config import Config
+from .config import Config, ConfigError
 from .install import (InstallError, add_pending, install_genesis, install_version,
                       installed_versions)
-from .ledger import Ledger, choose_version, parse_plan
+from .ledger import LedgerError, choose_version, parse_plan
 from .runner import Runner, load_state, set_height
 from .watch import check_once
 
 
 def _ledger(cfg):
-    return Ledger.load(cfg.get("node", "ledger"), cfg.get("node", "pending") or None)
+    return cfg.load_ledger(log=print)
 
 
 def cmd_plan(cfg, a):
@@ -54,12 +54,24 @@ def cmd_install(cfg, a):
         if not (a.version and a.url and a.sha256 and a.commit):
             print("--pending needs --version, --url, --sha256 and --commit")
             return 2
+        src = a.rpc or cfg.get("node", "rpc")
         hh, floor = a.halt_height, a.min_version
-        if hh is None:
-            hh, floor2 = rpc.scheduled_halt(a.rpc or cfg.get("node", "rpc"))
-            floor = floor or floor2
-            print("halt height %s and floor %s read from the chain" % (hh, floor or "none"))
-        add_pending(cfg, a.version, hh, floor, a.commit, a.url, a.sha256)
+        chain_height = None
+        try:
+            chain_height = rpc.status(src)["height"]
+            if hh is None and not a.rolling:
+                hh, floor2 = rpc.scheduled_halt(src)
+                floor = floor or floor2
+                print("read from %s: chain height %d, halt height %s, floor %s" % (
+                    src, chain_height, hh or "none", floor or "none"))
+        except rpc.RPCError as e:
+            if hh is None and not a.rolling:
+                print("error: cannot read the scheduled halt from %s (%s). Pass --rpc with a node that answers "
+                      "(for example the network's public RPC), or give --halt-height and --min-version." % (src, e))
+                return 1
+            print("note: could not read the chain height from %s; checking against the ledger only" % src)
+        add_pending(cfg, ledger, a.version, hh, floor, a.commit, a.url, a.sha256,
+                    chain_height=chain_height, rolling=a.rolling)
         ledger = _ledger(cfg)
     versions = a.version and [a.version] or []
     if a.all:
@@ -124,6 +136,7 @@ def main(argv=None):
     i.add_argument("--halt-height", type=int)
     i.add_argument("--min-version")
     i.add_argument("--rpc", help="RPC to read the scheduled halt from (default: the local node)")
+    i.add_argument("--rolling", action="store_true", help="with --pending: a rolling patch with no halt height")
     i.add_argument("--skip-version-check", action="store_true")
     g = sub.add_parser("genesis")
     g.add_argument("--url")
@@ -135,11 +148,15 @@ def main(argv=None):
     w.add_argument("--dry-run", action="store_true", help="check and print, send nothing")
     sub.add_parser("run")
     a = p.parse_args(argv)
-    cfg = Config(a.config)
+    try:
+        cfg = Config(a.config)
+    except Exception as e:
+        print("error: cannot read the config %s: %s" % (a.config, e))
+        return 1
     try:
         return {"plan": cmd_plan, "install": cmd_install, "genesis": cmd_genesis, "state": cmd_state,
                 "preflight": cmd_preflight, "watch": cmd_watch, "run": cmd_run}[a.cmd](cfg, a)
-    except InstallError as e:
+    except (InstallError, LedgerError, ConfigError, rpc.RPCError, ValueError, OSError) as e:
         print("error: %s" % e)
         return 1
 
