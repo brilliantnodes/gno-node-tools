@@ -93,6 +93,8 @@ class Runner:
         self.height = self.st.get("height")
         ch = self.st.get("chain_halt")
         self.chain_halt = tuple(ch) if isinstance(ch, list) and len(ch) == 2 else None
+        seen = self.st.get("halts_seen")
+        self.halts_seen = {h for h in seen if isinstance(h, int)} if isinstance(seen, list) else set()
         self._save_failed = False
         self._reset_run()
 
@@ -116,6 +118,14 @@ class Runner:
             if not self._save_failed:
                 self.log("cannot write the state file (%s); carrying on" % e)
             self._save_failed = True
+
+    def _remember_halt(self, h):
+        if h in self.halts_seen:
+            return
+        with self.lock:
+            self.halts_seen.add(h)
+            self.st["halts_seen"] = sorted(self.halts_seen)[-50:]
+            self._save()
 
     def _note_height(self, h, source, authoritative=False):
         with self.lock:
@@ -197,11 +207,16 @@ class Runner:
                 self.rpc_catching_up = s["catching_up"]
                 self._note_height(s["height"], "rpc")
                 hh, floor = rpc.scheduled_halt(base, timeout=4)
-                if hh and (hh, floor) != self.chain_halt:
+                # (0, "") is stored too: GovDAO cancels a scheduled halt by setting its height to 0.
+                if (hh, floor) != self.chain_halt:
                     self.chain_halt = (hh, floor)
                     with self.lock:
                         self.st["chain_halt"] = [hh, floor]
                         self._save()
+                # The params are never cleared and arm only on the exact height, so a halt param
+                # below the chain's height is a halt that has happened.
+                if hh and s["height"] > hh:
+                    self._remember_halt(hh)
             except Exception:
                 pass
             time.sleep(every)
@@ -238,7 +253,7 @@ class Runner:
         self.st.update({"version": version, "started": int(time.time())})
         self._save()
         return subprocess.Popen(cmd, cwd=self.cfg.home, env=env, stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT, bufsize=0)
+                                stderr=subprocess.STDOUT, bufsize=-1)
 
     def _reference_halt(self):
         ref = self.cfg.get("watch", "reference_rpc")
@@ -254,13 +269,15 @@ class Runner:
         h = entry.get("halt_height")
         if self.chain_halt and self.chain_halt[0] == h:
             return True, "the chain's halt param is %d" % h
-        if self.st.get("last_halt") == h and self.height is not None and self.height >= h:
-            return True, "this runner saw the chain halt at %d" % h
+        if h in self.halts_seen:
+            return True, "the chain halted at %d (recorded in the runner state)" % h
         ref = self._reference_halt()
         if ref and ref[0] == h:
             return True, "the reference RPC's halt param is %d" % h
         seen = self.chain_halt[0] if self.chain_halt else (ref[0] if ref else "unknown")
-        return False, "the chain does not confirm halt %d (last halt param seen: %s)" % (h, seen)
+        return False, ("the chain does not confirm halt %d (last halt param seen: %s). If gno.land cancelled that "
+                       "halt, delete the entry from the pending file; if the halt did happen and a later one is "
+                       "already scheduled, record it with `install --pending --past-halt`" % (h, seen))
 
     # ---- main loop -----------------------------------------------------------------------
     def run(self):
@@ -327,13 +344,15 @@ class Runner:
                     return EXIT_STOP
                 self.log("%s (pending) confirmed: %s" % (version, why))
             if version == last_version and last_outcome == "too_new":
-                self.log("%s was refused before its halt and no older version is installed for block %d; "
-                         "install the previous version" % (version, self.height + 1))
+                self.log("%s was refused before its halt and is still the version picked for block %d. Install "
+                         "the version for that block; if your replay plan forces %s here, set "
+                         "skip_upgrade_height to that halt height in config.toml for one restart and back to 0 "
+                         "afterwards, as gno.land's VALIDATOR.md describes" % (version, self.height + 1, version))
                 return EXIT_STOP
 
             self._reset_run()
             self.start_height = self.height
-            known_halts = ledger.halt_heights() | ({self.chain_halt[0]} if self.chain_halt else set())
+            known_halts = ledger.halt_heights() | ({self.chain_halt[0]} if self.chain_halt and self.chain_halt[0] else set())
             started = time.time()
             try:
                 self.child = self._start(version)
@@ -384,6 +403,7 @@ class Runner:
                 return 0
             if self.halt is not None:
                 self.st["last_halt"] = self.halt[0]
+                self._remember_halt(self.halt[0])
                 self._save()
                 last_version, last_outcome = version, "halt"
                 continue

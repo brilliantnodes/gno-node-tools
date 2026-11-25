@@ -47,22 +47,32 @@ def meets(v, floor):
 
 
 def halts_of(chain):
+    """[height, floor, proposed_at?, cancelled_at?] -> (height, floor, proposed_at, cancelled_at or None)."""
     out, prev = [], 0
     for item in chain["halts"]:
         x, f = int(item[0]), item[1]
-        proposed = int(item[2]) if len(item) > 2 else max(prev + 1, x - 5)
-        out.append((x, f, proposed))
+        proposed = int(item[2]) if len(item) > 2 and item[2] is not None else max(prev + 1, x - 5)
+        cancelled = int(item[3]) if len(item) > 3 else None
+        out.append((x, f, proposed, cancelled))
         prev = x
     return out
 
 
 def params_at(halts, h):
-    """The halt params in committed state at height h: the last halt whose proposal executed."""
-    hh, floor = 0, ""
-    for x, f, proposed in halts:
-        if proposed <= h:
-            hh, floor = x, f
+    """The halt params in committed state at height h: set by the last proposal that executed.
+    A cancellation (a later proposal setting height 0) leaves (0, "")."""
+    hh, floor, at = 0, "", -1
+    for x, f, proposed, cancelled in halts:
+        if proposed <= h and proposed > at:
+            hh, floor, at = x, f, proposed
+        if cancelled is not None and cancelled <= h and cancelled > at:
+            hh, floor, at = 0, "", cancelled
     return hh, floor
+
+
+def armed_halts(halts):
+    """Halt heights that actually fire (not cancelled before they were reached)."""
+    return {x for x, _f, _p, c in halts if c is None or c >= x}
 
 
 def main():
@@ -137,7 +147,7 @@ def main():
 
     # Restarted on the halt height after an upgrade: the network makes no block until enough
     # validators are back ("resume_delay" seconds), while this node's RPC already answers.
-    if any(x == h for x, _f, _p in halts) and h >= tip:
+    if h in armed_halts(halts) and h >= tip:
         end = time.time() + float(chain.get("resume_delay", 0))
         while time.time() < end and not state["stop"]:
             time.sleep(0.05)
@@ -168,7 +178,7 @@ def main():
         for i in range(int(chain.get("noise_per_block", 0))):
             out.write(b"debug \xc3\x28 block %d line %d " % (nxt, i) + (b"y" * 300) + b"\n")
         out.flush()
-        for x, _f, _p in halts:
+        for x in armed_halts(halts):
             if x == nxt:
                 print("GovDAO halt height reached, will halt after this block height=%d halt_height=%d" % (x, x),
                       flush=True)

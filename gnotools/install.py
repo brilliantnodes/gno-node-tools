@@ -227,13 +227,13 @@ def install_genesis(cfg, ledger, url=None, log=print):
 
 
 def add_pending(cfg, ledger, version, halt_height, halt_min_version, commit, url, sha256,
-                chain_height=None, rolling=False, log=print):
+                chain_height=None, rolling=False, past_halt=False, log=print):
     """Record an upgrade the official ledger does not list yet, so the runner can switch to it.
 
     Refuses anything that would make the runner start the wrong binary: a halt height at or
-    below the chain's current height or the ledger's last halt (the halt params are never
-    cleared, so the chain keeps showing the previous halt), a missing halt height for an
-    upgrade, or a floor that is not a version tag. Nothing is written unless the merged
+    below the ledger's last halt, or at or below the chain's current height unless the operator
+    states that this halt has already happened (past_halt); a missing halt height for an
+    upgrade; or a floor that is not a version tag. Nothing is written unless the merged
     ledger still validates.
     """
     path = cfg.get("node", "pending")
@@ -246,6 +246,9 @@ def add_pending(cfg, ledger, version, halt_height, halt_min_version, commit, url
         raise InstallError("give --commit (the release commit, 40 hex characters)")
     if not url or not url.startswith("https://"):
         raise InstallError("give --url with an https:// download link")
+    official_last = [e for e in ledger.entries if not e.get("pending")][-1]["version"]
+    if parse_version(version) <= parse_version(official_last):
+        raise InstallError("%s is not newer than %s, the official ledger's last release" % (version, official_last))
     if rolling:
         if halt_height:
             raise InstallError("a rolling release has no halt height; drop --halt-height or --rolling")
@@ -260,8 +263,10 @@ def add_pending(cfg, ledger, version, halt_height, halt_min_version, commit, url
             raise InstallError("halt height %d is not after the ledger's last halt %d: that halt is already "
                                "behind the chain (the params keep showing it until a new halt is voted)"
                                % (halt_height, last))
-        if chain_height is not None and halt_height <= chain_height:
-            raise InstallError("halt height %d is not ahead of the chain (height %d)" % (halt_height, chain_height))
+        if chain_height is not None and halt_height <= chain_height and not past_halt:
+            raise InstallError("halt height %d is not ahead of the chain (height %d). If that halt has already "
+                               "happened and the official ledger does not list it yet, add --past-halt"
+                               % (halt_height, chain_height))
         if halt_min_version and parse_version(halt_min_version) is None:
             raise InstallError("halt_min_version %r is not a vMAJOR.MINOR.PATCH tag" % halt_min_version)
     data = {"pending": []}

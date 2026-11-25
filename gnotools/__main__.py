@@ -20,7 +20,7 @@ from .config import Config, ConfigError
 from .install import (InstallError, add_pending, install_genesis, install_version,
                       installed_versions)
 from .ledger import LedgerError, choose_version, parse_plan
-from .runner import Runner, load_state, set_height
+from .runner import Runner, load_state, save_state, set_height
 from .watch import check_once
 
 
@@ -70,8 +70,19 @@ def cmd_install(cfg, a):
                       "(for example the network's public RPC), or give --halt-height and --min-version." % (src, e))
                 return 1
             print("note: could not read the chain height from %s; checking against the ledger only" % src)
+        if a.past_halt and a.halt_height is None:
+            print("--past-halt needs --halt-height (and --min-version): the chain's params now show a later halt")
+            return 2
         add_pending(cfg, ledger, a.version, hh, floor, a.commit, a.url, a.sha256,
-                    chain_height=chain_height, rolling=a.rolling)
+                    chain_height=chain_height, rolling=a.rolling, past_halt=a.past_halt)
+        if a.past_halt:
+            # The operator states that the chain halted there: let the runner start this version after it.
+            st = load_state(cfg)
+            seen = set(st.get("halts_seen") or [])
+            seen.add(int(hh))
+            st["halts_seen"] = sorted(seen)[-50:]
+            save_state(cfg, st)
+            print("recorded in the runner state that the chain halted at %d" % hh)
         ledger = _ledger(cfg)
     versions = a.version and [a.version] or []
     if a.all:
@@ -137,6 +148,8 @@ def main(argv=None):
     i.add_argument("--min-version")
     i.add_argument("--rpc", help="RPC to read the scheduled halt from (default: the local node)")
     i.add_argument("--rolling", action="store_true", help="with --pending: a rolling patch with no halt height")
+    i.add_argument("--past-halt", action="store_true",
+                   help="with --pending: this halt has already happened (give --halt-height and --min-version)")
     i.add_argument("--skip-version-check", action="store_true")
     g = sub.add_parser("genesis")
     g.add_argument("--url")

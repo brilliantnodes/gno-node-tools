@@ -117,14 +117,26 @@ class Ledger:
         self.chain_id = data.get("chain_id")
         self.genesis_sha256 = (data.get("genesis_sha256") or "").lower()
         self.from_cache = False
+        self.dropped_pending = []     # pending entries the official ledger has caught up with
         entries = list(data.get("upgrades") or [])
         known = {e.get("version") for e in entries}
+        last_h = max([e.get("halt_height") or 0 for e in entries if e.get("kind") == "upgrade"] or [0])
+        last_v = parse_version(entries[-1].get("version")) if entries else None
         for p in pending or []:
-            if p.get("version") not in known:   # once the official ledger has it, the ledger wins
-                q = dict(p)
-                q.setdefault("kind", "upgrade" if q.get("halt_height") else "rolling")
-                q["pending"] = True
-                entries.append(q)
+            q = dict(p)
+            q.setdefault("kind", "upgrade" if q.get("halt_height") else "rolling")
+            qv = parse_version(q.get("version"))
+            # Once the official ledger covers this upgrade, the ledger wins: same tag, a halt at or
+            # below the ledger's last halt (gno.land may record another tag, e.g. -rc.2), or a
+            # version not newer than the ledger's last entry.
+            if (q.get("version") in known
+                    or (q["kind"] == "upgrade" and isinstance(q.get("halt_height"), int)
+                        and q["halt_height"] <= last_h)
+                    or (qv is not None and last_v is not None and qv <= last_v)):
+                self.dropped_pending.append(q.get("version"))
+                continue
+            q["pending"] = True
+            entries.append(q)
         self.entries = entries
         self._validate()
         self.eras = self._eras()
@@ -140,8 +152,7 @@ class Ledger:
         if is_url(source) and cache:
             try:
                 data = load_json(source)
-                cls(data)   # validate before caching
-                write_json(cache, data)
+                cls(data)   # validate before using or caching it
             except Exception as e:
                 if not os.path.isfile(cache):
                     raise
@@ -149,6 +160,12 @@ class Ledger:
                     log("could not use the ledger at %s (%s); using the cached copy %s" % (source, e, cache))
                 data = load_json(cache)
                 from_cache = True
+            else:
+                try:
+                    write_json(cache, data)
+                except OSError as e:
+                    if log:
+                        log("could not update the ledger cache %s (%s); using the downloaded ledger" % (cache, e))
         else:
             data = load_json(source)
         pending = []

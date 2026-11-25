@@ -2,7 +2,7 @@
 
 ## 0.2.0 (25 November 2026)
 
-An independent review of 0.1 checked the code against gno's own source (`chain/mainnet` branch). It confirmed that the log patterns and the block-range rules match gno, and found the problems below. Each one is fixed, and each runner fix has a test that fails on 0.1.
+An independent review of 0.1 checked the code against gno's own source (`chain/mainnet` branch). It confirmed that the log patterns and the block-range rules match gno, and found the problems below. A second independent review checked the fixes and found further edge cases (listed last). Everything is fixed. Each fix has a test that fails without it, except the stop signal during a switch and the shutdown when the output reader stops.
 
 ### Serious
 - **The node could freeze silently.** The runner reads the node's output through a pipe. In 0.1, one byte that is not valid UTF-8, a full disk, or a broken stdout ended that reading, the pipe filled up, and the node stopped producing blocks while its process stayed alive. The reader now decodes leniently, survives errors on any single line, and if it ever stops, the runner stops the node cleanly instead of leaving it blocked. Test: 3,000 lines of invalid UTF-8 plus 50 lines per block.
@@ -10,12 +10,21 @@ An independent review of 0.1 checked the code against gno's own source (`chain/m
 
 ### Important
 - An upgrade known only from the local pending file now starts only once the chain confirms its halt height (the chain's halt parameter, or a halt the runner saw happen). This catches a wrong halt height typed by hand, which the node's own start-up check does not catch between halts.
-- A halt is also detected from the block height staying on a known halt height when no halt line appears in the log (gno's UPGRADES.md: "watch the height, not the log").
+- A halt is also detected from the block height staying on a known halt height, in case the halt line is missed. This applies only to a release started below that height: a new release waiting at the halt height for the other validators is left alone.
 - An unreadable ledger at an upgrade no longer crashes the runner into a restart loop; a good copy of the ledger is cached and used if GitHub cannot be reached.
 - A scheduled halt with its binary installed but not recorded is now a failure when the halt is within 20,000 blocks (0.1 only warned, and the watch never alerted on it).
 - The watch no longer alerts when the reference node is down, or when the whole network has stopped at the same height.
 - Files written by the tool are readable by the service user (0.1 left some at mode 0600).
 - The ledger is accepted only over https or from a local file; commit hashes, version tags and checksums are checked before use.
+
+### From the second review
+- A cancelled halt (GovDAO sets the height back to 0) is now remembered, so a pending entry for that height is not started afterwards.
+- Every halt the runner sees is kept, not only the last one. A halt that has already happened can be recorded with `install --pending --past-halt` when gno.land has not listed it yet.
+- A pending entry is dropped once the official ledger covers that halt, even under another tag (for example `-rc.2` instead of `-rc.1`); `preflight` says so. Before, the ledger failed to load.
+- The node's output is read through a buffer (one byte per system call before, about 100 times slower).
+- If the ledger cache cannot be written, the freshly downloaded ledger is still used.
+- When a replay plan forces a release that the node refuses before its halt, the message points to gno.land's documented remedy (`skip_upgrade_height` for one restart).
+- Docs: a quick start that works for a new node; config file permissions that the service can read; a reference node in the mainnet example.
 
 ### Smaller
 - A stop signal during a binary switch no longer leaves a node running.

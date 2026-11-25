@@ -251,6 +251,31 @@ class RunnerRobustness(unittest.TestCase):
         finally:
             n.cleanup()
 
+    def test_cancelled_halt_does_not_confirm_a_pending_entry(self):
+        # GovDAO schedules the halt at 45 (block 38), then cancels it (block 42). The chain runs past 45.
+        # On the next start the pending v1.9.0 (halt 45) must not be started for blocks it does not serve.
+        chain = dict(CHAIN, tip_interval=0.4,
+                     halts=[[10, "v1.6.0"], [20, "v1.7.0"], [30, "v1.8.0"], [45, "v1.9.0", 38, 42]])
+        n = TestNode(LEDGER, PENDING, chain, ALL)
+        try:
+            n.set_data_height(36)
+            os.makedirs(os.path.join(n.root, "state"))
+            with open(os.path.join(n.root, "state", "runner.json"), "w") as f:
+                json.dump({"height": 36}, f)
+            p = n.start_runner()
+            self.assertTrue(n.wait_for(lambda: n.height() >= 47, timeout=60), n.log_text()[-2000:])
+            n.stop(p)
+            with open(os.path.join(n.root, "state", "runner.json")) as f:
+                self.assertEqual(json.load(f).get("chain_halt"), [0, ""])
+            p = n.start_runner()
+            rc = p.wait(timeout=60)
+            log = n.log_text()
+            self.assertEqual(rc, EXIT_STOP, log[-2000:])
+            self.assertIn("does not confirm halt 45", log)
+            self.assertNotIn("starting v1.9.0", log)
+        finally:
+            n.cleanup()
+
     def test_broken_ledger_at_a_switch_stops_cleanly(self):
         n = TestNode(LEDGER, PENDING, dict(CHAIN, sync_interval=0.05), ALL)
         try:

@@ -32,40 +32,45 @@ Standard library only. Python 3.8 or newer. MIT licence.
 
 Version 0.2, 25 November 2026.
 
-- **Tested:** 58 automated tests, on Python 3.8 and 3.13. They run the tool against a simulator of `gnoland` whose log lines, exit codes and start-up checks were copied from gno's source (`chain/mainnet` branch). Each log pattern the tool relies on was checked against the line in gno's source that prints it.
+- **Tested:** 63 automated tests, on Python 3.8 and 3.13. They run the tool against a simulator of `gnoland` whose log lines, exit codes and start-up checks were copied from gno's source (`chain/mainnet` branch). Each log pattern the tool relies on was checked against the line in gno's source that prints it.
 - **Run against the live network:** the read-only commands (`plan`, `preflight`) against the public Onyx node on 25 November 2026.
 - **Not yet done:** managing a live node through a real halt. Our first live run is on our own Onyx node, before Onyx's next upgrade. Until then, treat `run` as tested in simulation only, and watch your node at each upgrade.
-- **Reviewed:** an independent review of version 0.1 found 2 serious problems and 7 important ones. All are fixed in 0.2, and each fix has a test that fails on 0.1. See [CHANGELOG.md](CHANGELOG.md).
+- **Reviewed:** two independent reviews. The first, of version 0.1, found 2 serious problems and 7 important ones; the second, of the fixes, found 6 more edge cases. All are fixed in 0.2, and most fixes have a test that fails without them. See [CHANGELOG.md](CHANGELOG.md).
 
 ## Quick start (Onyx)
 
-The full procedure, including how to move an existing node over, is in [docs/OPERATOR_GUIDE.md](docs/OPERATOR_GUIDE.md).
-
-A new node also needs its `config.toml` and keys first (`gnoland config init`, `gnoland secrets init`, and the settings in Onyx's [VALIDATOR.md](https://github.com/gnolang/gno/blob/chain/mainnet/misc/deployments/onyx.gno.land/VALIDATOR.md), section 3).
+Moving a node that already runs? Follow [docs/OPERATOR_GUIDE.md](docs/OPERATOR_GUIDE.md), section 3, instead. The steps below set up a new node that syncs from the first block.
 
 ```shell
 # 1. A service user that owns the node's folders
 sudo /usr/sbin/useradd --system --create-home --home-dir /var/lib/gnoland --shell /usr/sbin/nologin gnoland
 sudo /usr/bin/install -d -o gnoland -g gnoland /opt/gno
 
-# 2. Get the code and the example config (readable by the service user only)
+# 2. The code, and the example config (owner root, readable by the gnoland group only)
 sudo /usr/bin/git clone https://github.com/brilliantnodes/gno-node-tools /opt/gno-node-tools
 sudo /usr/bin/install -d /etc/gno-node-tools
-sudo /usr/bin/install -m 640 -g gnoland /opt/gno-node-tools/examples/onyx.ini /etc/gno-node-tools/onyx.ini
+sudo /usr/bin/install -m 640 -o root -g gnoland /opt/gno-node-tools/examples/onyx.ini /etc/gno-node-tools/onyx.ini
 
 # 3. See which release serves which blocks
 sudo -u gnoland /usr/bin/env PYTHONPATH=/opt/gno-node-tools /usr/bin/python3 -m gnotools --config /etc/gno-node-tools/onyx.ini plan
 
-# 4. Install the releases the plan needs (checksums checked; GNOROOT checked out at each release commit)
+# 4. Install the two releases the example plan uses, and the genesis file (each checked against the ledger)
+sudo -u gnoland /usr/bin/env PYTHONPATH=/opt/gno-node-tools /usr/bin/python3 -m gnotools --config /etc/gno-node-tools/onyx.ini install --version v1.7.1-rc.1
 sudo -u gnoland /usr/bin/env PYTHONPATH=/opt/gno-node-tools /usr/bin/python3 -m gnotools --config /etc/gno-node-tools/onyx.ini install --version v1.8.0-rc.1
+sudo -u gnoland /usr/bin/env PYTHONPATH=/opt/gno-node-tools /usr/bin/python3 -m gnotools --config /etc/gno-node-tools/onyx.ini genesis
 
-# 5. Check everything before starting
+# 5. The node's own config and keys, made with the installed release, in the node's folder
+sudo -u gnoland /bin/sh -c 'cd /var/lib/gnoland && GNOROOT=/opt/gno/versions/v1.8.0-rc.1/gno /opt/gno/versions/v1.8.0-rc.1/gnoland config init && GNOROOT=/opt/gno/versions/v1.8.0-rc.1/gno /opt/gno/versions/v1.8.0-rc.1/gnoland secrets init'
+#    Then set the values in Onyx's VALIDATOR.md, section 3 (persistent peers, moniker, external address and the rest).
+
+# 6. Check before the first start. Until the node runs, the "rpc" line fails (nothing answers yet):
+#    that one is expected; every other line should read OK.
 sudo -u gnoland /usr/bin/env PYTHONPATH=/opt/gno-node-tools /usr/bin/python3 -m gnotools --config /etc/gno-node-tools/onyx.ini preflight
 
-# 6. Run it under systemd, plus the 5-minute watch
-sudo cp /opt/gno-node-tools/examples/systemd/gno-node.service /opt/gno-node-tools/examples/systemd/gno-watch.* /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now gno-node.service gno-watch.timer
+# 7. Run it under systemd, plus the 5-minute watch
+sudo /usr/bin/cp /opt/gno-node-tools/examples/systemd/gno-node.service /opt/gno-node-tools/examples/systemd/gno-watch.service /opt/gno-node-tools/examples/systemd/gno-watch.timer /etc/systemd/system/
+sudo /usr/bin/systemctl daemon-reload
+sudo /usr/bin/systemctl enable --now gno-node.service gno-watch.timer
 ```
 
 ## Safety rules it follows
@@ -80,7 +85,7 @@ sudo systemctl enable --now gno-node.service gno-watch.timer
 
 It alerts on: the node's RPC not answering, the service down, the block height stuck for 15 minutes while the network moves on, the node more than 30 blocks behind a reference node, fewer than 3 peers, disk at 90 per cent, a scheduled halt within 20,000 blocks without its binary installed and recorded, a leftover `halt_height` in `config.toml`, and a binary whose checksum no longer matches.
 
-It does not alert on: problems seen fewer than 3 checks in a row; the whole network stopping together (for example at a coordinated halt, when the reference node is stopped at the same height); the reference node being down; a problem clearing (unless you turn that on).
+It does not alert on: problems seen fewer than 3 checks in a row; the whole network stopping together, for example at a coordinated halt (this needs `watch.reference_rpc` set: the watch sees that the reference node is stopped at the same height); the reference node being down; a problem clearing (unless you turn that on). Without a reference node, a coordinated halt that lasts 15 minutes is alerted as a stuck height.
 
 ## Requirements
 

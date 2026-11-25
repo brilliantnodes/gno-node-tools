@@ -106,6 +106,19 @@ class Pending(unittest.TestCase):
                     log=lambda m: None)
         self.assertEqual(self.cfg.load_ledger().entry("v1.8.1")["kind"], "rolling")
 
+    def test_past_halt_can_be_recorded_explicitly(self):
+        # The halt at 900 happened, gno.land has not listed it yet, and the params already show 1200.
+        url = self.rpc(height=1000, halt=(1200, "v2.0.0"))
+        rc, out = self.cli("--rpc", url, "--halt-height", "900", "--min-version", "v1.9.0")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("--past-halt", out)
+        rc, out = self.cli("--rpc", url, "--halt-height", "900", "--min-version", "v1.9.0", "--past-halt")
+        self.assertIn("recorded in the runner state that the chain halted at 900", out)
+        led = self.cfg.load_ledger()
+        self.assertEqual(led.entry("v1.9.0")["halt_height"], 900)
+        with open(os.path.join(self.node.root, "state", "runner.json")) as f:
+            self.assertIn(900, json.load(f)["halts_seen"])
+
     def test_bad_commit_and_url_are_refused(self):
         led = self.cfg.load_ledger()
         for commit, url in (("--upload-pack=x", "https://x/g"), ("d" * 40, "http://x/g")):
@@ -146,6 +159,30 @@ class Safety(unittest.TestCase):
         self.assertTrue(led.from_cache)
         self.assertEqual(led.chain_id, "test-1")
         self.assertIn("cached copy", logs[0])
+
+    def test_official_entry_with_another_tag_supersedes_pending(self):
+        official = {"chain_id": "x", "upgrades": LEDGER + [
+            {"kind": "upgrade", "version": "v1.9.0-rc.2", "commit": C, "halt_height": 45, "halt_min_version": "v1.9.0-rc.2"}]}
+        pend = [{"kind": "upgrade", "version": "v1.9.0-rc.1", "commit": C, "halt_height": 45, "halt_min_version": "v1.9.0-rc.1"}]
+        led = Ledger(official, pend)
+        self.assertEqual(led.dropped_pending, ["v1.9.0-rc.1"])
+        self.assertEqual(led.eras[-1].versions, ["v1.9.0-rc.2"])
+
+    def test_unwritable_cache_still_uses_the_downloaded_ledger(self):
+        import gnotools.ledger as L
+        with open(self.node.ledger) as f:
+            data = json.load(f)
+        blocker = os.path.join(self.node.dir, "a-file")
+        open(blocker, "w").close()
+        real, logs = L.load_json, []
+        L.load_json = lambda src, timeout=30: data if src.startswith("https://") else real(src, timeout)
+        try:
+            led = Ledger.load("https://example.invalid/upgrades.json", cache=os.path.join(blocker, "c.json"),
+                              log=logs.append)
+        finally:
+            L.load_json = real
+        self.assertFalse(led.from_cache)
+        self.assertIn("could not update the ledger cache", logs[0])
 
     def test_failed_gnoroot_checkout_leaves_nothing_behind(self):
         self.cfg.cp.set("node", "gno_repo", os.path.join(self.node.dir, "no-such-repo"))

@@ -82,6 +82,9 @@ def run_checks(cfg, local_status=None):
     except (OSError, ValueError, LedgerError, ConfigError) as e:
         add("fail", "ledger", "cannot read the ledger: %s" % e)
         return out
+    if ledger.dropped_pending:
+        add("warn", "pending", "the official ledger now covers %s; you can remove it from the pending file"
+            % ", ".join(ledger.dropped_pending))
     want_chain = cfg.get("node", "chain_id")
     if want_chain and ledger.chain_id != want_chain:
         add("fail", "ledger", "ledger is for %s, config says %s" % (ledger.chain_id, want_chain))

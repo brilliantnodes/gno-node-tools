@@ -39,14 +39,14 @@ Every setting has a default (`gnotools/config.py`); the example `examples/onyx.i
 | `runner.halt_grace_seconds` | After the node logs a halt, how long to wait before stopping it. | 20 |
 | `runner.halt_stall_seconds` | With no halt line in the log, how long the height must stay on a known halt height before the runner treats it as halted. | 60 |
 | `runner.stop_timeout_seconds` | How long to wait for the node to stop before killing it. | 90 |
-| `watch.reference_rpc` | A node you do not run, used to tell "my node is behind" from "the whole network stopped". | none |
+| `watch.reference_rpc` | A node you do not run, used to tell "my node is behind" from "the whole network stopped". Without it, a coordinated halt longer than 15 minutes is alerted. Public RPCs: `https://rpc.onyx.testnets.gno.land`, `https://rpc.gno.land`. | none |
 | `watch.service` | The systemd unit to check, e.g. `gno-node`. | none |
 | `watch.confirm_checks` | How many checks in a row a problem must be seen before an alert. | 3 |
 | `watch.stall_minutes` | Height unchanged this long counts as stuck. | 15 |
 | `watch.max_lag_blocks`, `watch.min_peers`, `watch.disk_percent` | Limits for lag, peers and disk use. | 30, 3, 90 |
 | `watch.halt_warn_blocks` | A scheduled halt this close without its binary ready is a failure. | 20000 |
 | `watch.repeat_hours` | How often an open problem is repeated. | 12 |
-| `notify.*` | Telegram bot token and chat id, a Discord webhook, or any webhook. If you set any, `chmod 640` the file and keep it owned by root, group `gnoland`. | none |
+| `notify.*` | Telegram bot token and chat id, a Discord webhook, or any webhook. Keep the file owned by root, group `gnoland`, mode 640. | none |
 
 ## 3. Moving an existing node to the runner
 
@@ -92,9 +92,12 @@ Do this between upgrades, not close to a halt. Your validator stops signing for 
    (`v1.9.0-rc.1` is an example.) If your own node's RPC is down, add `--rpc https://rpc.onyx.testnets.gno.land`, or give `--halt-height` and `--min-version` yourself. The command refuses a halt height that is already behind the chain.
 3. **Check:** `gt preflight` should now say the binary for after the halt is ready.
 4. **At the halt** the node stops after the halt block. The runner stops the process if it is still up, starts the new release, and logs each step (`journalctl -u gno-node | grep gno-runner`). Nothing to do unless the watch alerts.
-5. Once gno.land adds the release to the official ledger, the ledger entry replaces your pending one automatically.
+5. Once gno.land adds the upgrade to the official ledger, your pending entry is ignored automatically, even if gno.land records another tag for it; `gt preflight` then tells you it can be removed.
+6. If a halt has already happened but gno.land has not listed it yet, and a later halt is already scheduled (so the chain's halt parameter shows the later one), record it with `--past-halt --halt-height H --min-version vX.Y.Z`.
 
-A halt with no minimum version is a coordinated pause, not an upgrade: the runner restarts the same release after it.
+A halt with no minimum version has no version gate. The runner restarts the same release after it, unless the ledger or your pending file lists a release for that halt (mainnet's v1.3.0 to v1.5.0 were upgrades of this kind).
+
+If GovDAO cancels a scheduled halt (sets its height back to 0), the runner will not start a pending release for it: delete that entry from the pending file.
 
 ## 5. Joining from genesis
 
@@ -106,8 +109,10 @@ The runner exits with code **3** for problems a restart cannot fix; the example 
 
 | Runner log says | Meaning | What to do |
 |---|---|---|
+| `replay plan wants X for block N, but it is not installed` | The example configs set a replay plan, and that release is missing. | `gt install --version X` |
 | `block N needs one of ... none is installed` | The release for the next block is missing or its checksum no longer matches. | `gt install --for-height <N-1>` |
 | `... comes only from the pending file and the chain does not confirm halt H` | The halt height you recorded does not match the chain. | `gt preflight` shows the chain's halt; record it again with `gt install --pending`. |
+| `was refused before its halt and is still the version picked` | The runner's height record is behind the node's data, or the replay plan forces a release the node refuses here. | Install the release for that block; with a plan, follow the message (`skip_upgrade_height` for one restart). |
 | `is below the governance minimum` | The chain passed a halt this runner does not know about. | Record and install that release (section 4, step 2). |
 | `wrong AppHash` | That release cannot process these blocks. | Check `node.plan` and `gt plan`. |
 | `a node already answers on ...` | Another node is running. | Stop it first. Never run two copies of one validator. |
